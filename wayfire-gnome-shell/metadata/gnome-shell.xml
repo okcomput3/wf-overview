@@ -67,6 +67,12 @@
                 <min>5</min>
                 <max>50</max>
             </option>
+            
+            <option name="wallpaper" type="string">
+                <_short>Wallpaper Path</_short>
+                <_long>Path to wallpaper image for overview background (PNG format)</_long>
+                <default>/home/light/Pictures/wallpapers/Dynamic-Wallpapers/Light/Beach_light.png</default>
+            </option>
         </group>
     </plugin>
 </wayfire>
