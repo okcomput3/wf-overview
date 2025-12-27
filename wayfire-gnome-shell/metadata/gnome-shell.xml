@@ -1,0 +1,72 @@
+<?xml version="1.0"?>
+<wayfire>
+    <plugin name="gnome-shell">
+        <_short>GNOME Shell</_short>
+        <_long>GNOME Shell-like desktop experience with top panel, Activities button, and window overview with rounded corners</_long>
+        <category>Desktop</category>
+        
+        <group>
+            <_short>Activation</_short>
+            
+            <option name="toggle" type="activator">
+                <_short>Toggle Overview</_short>
+                <_long>Key/button to toggle the Activities overview</_long>
+                <default>&lt;super&gt;</default>
+            </option>
+        </group>
+        
+        <group>
+            <_short>Panel</_short>
+            
+            <option name="panel_height" type="int">
+                <_short>Panel Height</_short>
+                <_long>Height of the top panel in pixels</_long>
+                <default>32</default>
+                <min>24</min>
+                <max>64</max>
+            </option>
+            
+            <option name="panel_color" type="string">
+                <_short>Panel Color</_short>
+                <_long>Background color of the panel (hex format #RRGGBBAA)</_long>
+                <default>#1a1a1aE6</default>
+            </option>
+        </group>
+        
+        <group>
+            <_short>Overview</_short>
+            
+            <option name="corner_radius" type="int">
+                <_short>Corner Radius</_short>
+                <_long>Radius of rounded corners on windows in overview</_long>
+                <default>12</default>
+                <min>0</min>
+                <max>30</max>
+            </option>
+            
+            <option name="animation_duration" type="int">
+                <_short>Animation Duration</_short>
+                <_long>Duration of overview animation in milliseconds</_long>
+                <default>300</default>
+                <min>100</min>
+                <max>1000</max>
+            </option>
+            
+            <option name="overview_scale" type="double">
+                <_short>Overview Scale</_short>
+                <_long>Scale factor for windows in overview (0.5 - 1.0)</_long>
+                <default>0.85</default>
+                <min>0.5</min>
+                <max>1.0</max>
+            </option>
+            
+            <option name="spacing" type="int">
+                <_short>Window Spacing</_short>
+                <_long>Space between windows in overview</_long>
+                <default>20</default>
+                <min>5</min>
+                <max>50</max>
+            </option>
+        </group>
+    </plugin>
+</wayfire>
