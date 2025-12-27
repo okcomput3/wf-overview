@@ -1,6 +1,6 @@
 /**
  * Wayfire GNOME Shell Plugin
- * 
+ *  copyright andrew pliatsikas
  * A GNOME Shell-like experience for Wayfire:
  * - Top panel with Activities button, clock
  * - Click Activities (or press Super) to enter overview mode
@@ -1046,6 +1046,7 @@ class overview_render_node_t : public wf::scene::node_t
     OpenGL::program_t *tex_program;
     OpenGL::program_t *rounded_tex_program;
     OpenGL::program_t *col_program;
+    GLuint wallpaper_texture;
     
     // Workspace capture data structure (public so render_overview can use it)
     struct workspace_capture_t {
@@ -1167,9 +1168,10 @@ class overview_render_node_t : public wf::scene::node_t
     
     overview_render_node_t(wf::output_t *output, activities_view_t *activities,
                            OpenGL::program_t *tex_prog, OpenGL::program_t *rounded_tex_prog,
-                           OpenGL::program_t *col_prog) 
+                           OpenGL::program_t *col_prog, GLuint wallpaper_tex) 
         : node_t(false), output(output), activities(activities),
-          tex_program(tex_prog), rounded_tex_program(rounded_tex_prog), col_program(col_prog)
+          tex_program(tex_prog), rounded_tex_program(rounded_tex_prog), col_program(col_prog),
+          wallpaper_texture(wallpaper_tex)
     {
     }
     
@@ -1330,12 +1332,22 @@ class overview_render_node_t : public wf::scene::node_t
             
             if (alpha < 0.01f) return;
             
-            // Clear with grey background
-            GL_CALL(glClearColor(0.3f, 0.3f, 0.3f, 0.85f));
+            // Clear first
+            GL_CALL(glClearColor(0.0f, 0.0f, 0.0f, 1.0f));
             GL_CALL(glClear(GL_COLOR_BUFFER_BIT));
             
             float corner_r = activities->corner_radius;
             int animating_ws_idx = activities->get_animating_workspace_index();
+            
+            // Draw wallpaper as background
+            if (wallpaper_texture != 0)
+            {
+                wf::geometry_t bg_geo = {og.x, og.y, og.width, og.height};
+                render_texture(data.target, wallpaper_texture, bg_geo, 1.0f, true);
+                
+                // Draw dark semi-transparent overlay
+                render_solid_rect(data.target, bg_geo, glm::vec4(0.0f, 0.0f, 0.0f, 0.5f));
+            }
             
             // Draw ALL small workspace thumbnails at BOTTOM (including current)
             auto& ws_geometries = activities->get_workspace_geometries();
@@ -1402,6 +1414,12 @@ class gnome_shell_output_t : public wf::per_output_plugin_instance_t
     OpenGL::program_t col_program;
     bool programs_loaded = false;
     
+    // Wallpaper texture
+    GLuint wallpaper_texture = 0;
+    int wallpaper_width = 0;
+    int wallpaper_height = 0;
+    std::string wallpaper_path = "/home/light/Pictures/wallpapers/Dynamic-Wallpapers/Light/Beach_light.png";
+    
     int panel_height = 16;
     std::string panel_color = "#1a1a1aE6";
     int corner_radius = 12;
@@ -1409,16 +1427,51 @@ class gnome_shell_output_t : public wf::per_output_plugin_instance_t
     double overview_scale = 0.85;
     int spacing = 20;
 
+    void load_wallpaper()
+    {
+        cairo_surface_t *img = cairo_image_surface_create_from_png(wallpaper_path.c_str());
+        if (cairo_surface_status(img) != CAIRO_STATUS_SUCCESS)
+        {
+            LOGE("Failed to load wallpaper from: ", wallpaper_path);
+            cairo_surface_destroy(img);
+            return;
+        }
+        
+        wallpaper_width = cairo_image_surface_get_width(img);
+        wallpaper_height = cairo_image_surface_get_height(img);
+        unsigned char *data = cairo_image_surface_get_data(img);
+        
+        wf::gles::run_in_context([&] {
+            if (wallpaper_texture == 0)
+            {
+                GL_CALL(glGenTextures(1, &wallpaper_texture));
+            }
+            
+            GL_CALL(glBindTexture(GL_TEXTURE_2D, wallpaper_texture));
+            GL_CALL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR));
+            GL_CALL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR));
+            GL_CALL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE));
+            GL_CALL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE));
+            GL_CALL(glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, wallpaper_width, wallpaper_height, 0,
+                         GL_BGRA_EXT, GL_UNSIGNED_BYTE, data));
+            GL_CALL(glBindTexture(GL_TEXTURE_2D, 0));
+        });
+        
+        cairo_surface_destroy(img);
+        LOGI("Loaded wallpaper: ", wallpaper_width, "x", wallpaper_height);
+    }
+
     void init() override
     {
         panel = std::make_unique<top_panel_t>(output, panel_height, panel_color);
         activities = std::make_unique<activities_view_t>(output);
         activities->set_config(corner_radius, overview_scale, spacing, panel_height, animation_duration);
         
-        // Load shader programs
+        // Load shader programs and wallpaper
         wf::gles::run_in_context([&] {
             load_programs();
         });
+        load_wallpaper();
         
         // PRE hook for animation ticking and managing render node
         pre_hook = [this]() { 
@@ -1428,7 +1481,8 @@ class gnome_shell_output_t : public wf::per_output_plugin_instance_t
                 if (!render_node)
                 {
                     render_node = std::make_shared<overview_render_node_t>(
-                        output, activities.get(), &tex_program, &rounded_tex_program, &col_program);
+                        output, activities.get(), &tex_program, &rounded_tex_program, &col_program,
+                        wallpaper_texture);
                     wf::scene::add_front(wf::get_core().scene(), render_node);
                 }
                 
@@ -1637,6 +1691,11 @@ class gnome_shell_output_t : public wf::per_output_plugin_instance_t
             tex_program.free_resources();
             rounded_tex_program.free_resources();
             col_program.free_resources();
+            if (wallpaper_texture)
+            {
+                glDeleteTextures(1, &wallpaper_texture);
+                wallpaper_texture = 0;
+            }
         });
         
         activities.reset();
@@ -1695,6 +1754,7 @@ class wayfire_gnome_shell_t : public wf::plugin_interface_t
     wf::option_wrapper_t<double> opt_overview_scale{"gnome-shell/overview_scale"};
     wf::option_wrapper_t<int> opt_spacing{"gnome-shell/spacing"};
     wf::option_wrapper_t<wf::activatorbinding_t> opt_toggle{"gnome-shell/toggle"};
+    wf::option_wrapper_t<std::string> opt_wallpaper{"gnome-shell/wallpaper"};
     
     std::map<wf::output_t*, std::unique_ptr<gnome_shell_output_t>> outputs;
     
@@ -1741,6 +1801,13 @@ class wayfire_gnome_shell_t : public wf::plugin_interface_t
         inst->overview_scale = opt_overview_scale;
         inst->spacing = opt_spacing;
         inst->output = output;
+        
+        std::string wp = (std::string)opt_wallpaper;
+        if (!wp.empty())
+        {
+            inst->wallpaper_path = wp;
+        }
+        
         inst->init();
         
         auto* ptr = inst.get();
