@@ -506,7 +506,7 @@ class top_panel_t {
   // NEW: Returns the panel geometry in output coordinates for damage
   wf::geometry_t get_panel_geometry() const {
     auto og = output->get_layout_geometry();
-    return {og.x, og.y, panel_width, panel_height};
+    return {og.x, og.y + og.height - panel_height, panel_width, panel_height};
   }
 
   // NEW: Returns activities button geometry in output coordinates
@@ -1065,6 +1065,7 @@ class overview_render_node_t : public wf::scene::node_t {
   OpenGL::program_t *rounded_tex_program;
   OpenGL::program_t *col_program;
   GLuint wallpaper_texture;
+  top_panel_t *panel; 
 
   // Workspace capture data structure (public so render_overview can use it)
   struct workspace_capture_t {
@@ -1125,41 +1126,48 @@ class overview_render_node_t : public wf::scene::node_t {
       }
     }
 
-    void schedule_instructions(
-        std::vector<wf::scene::render_instruction_t> &instructions,
-        const wf::render_target_t &target, wf::region_t &damage) override {
-      auto bbox = self->get_bounding_box();
-      const float scale = self->output->handle->scale;
+void schedule_instructions(
+    std::vector<wf::scene::render_instruction_t>& instructions,
+    const wf::render_target_t& target, wf::region_t& damage) override
+{
+    auto bbox = self->get_bounding_box();
+    const float scale = self->output->handle->scale;
 
-      // Render ALL workspaces to their framebuffers
-      for (auto &capture : workspace_captures) {
-        auto ws_bbox = capture.stream->get_bounding_box();
-        capture.framebuffer.allocate(wf::dimensions(ws_bbox), scale);
+    // Force full damage on workspace captures during animation
+    bool is_animating = self->activities->currently_animating();
 
-        wf::render_target_t ws_target{capture.framebuffer};
-        ws_target.geometry = ws_bbox;
-        ws_target.scale = scale;
+    // Render ALL workspaces to their framebuffers
+    for (auto &capture : workspace_captures) {
+      auto ws_bbox = capture.stream->get_bounding_box();
+      capture.framebuffer.allocate(wf::dimensions(ws_bbox), scale);
 
-        wf::render_pass_params_t params;
-        params.instances = &capture.instances;
-        params.damage = capture.damage;
-        params.reference_output = self->output;
-        params.target = ws_target;
-        params.flags = wf::RPASS_CLEAR_BACKGROUND | wf::RPASS_EMIT_SIGNALS;
+      wf::render_target_t ws_target{capture.framebuffer};
+      ws_target.geometry = ws_bbox;
+      ws_target.scale = scale;
 
-        wf::render_pass_t::run(params);
-        capture.damage.clear();
-      }
+      // If animating, force full redraw of workspace capture
+      wf::region_t ws_damage = is_animating ? ws_bbox : capture.damage;
 
-      // Schedule our render instruction
-      instructions.push_back(wf::scene::render_instruction_t{
-          .instance = this,
-          .target = target,
-          .damage = damage & bbox,
-      });
+      wf::render_pass_params_t params;
+      params.instances = &capture.instances;
+      params.damage = ws_damage;
+      params.reference_output = self->output;
+      params.target = ws_target;
+      params.flags = wf::RPASS_CLEAR_BACKGROUND | wf::RPASS_EMIT_SIGNALS;
 
-      damage ^= bbox;
+      wf::render_pass_t::run(params);
+      capture.damage.clear();
     }
+
+    // Schedule our render instruction
+    instructions.push_back(wf::scene::render_instruction_t{
+        .instance = this,
+        .target = target,
+        .damage = damage & bbox,
+    });
+
+    damage ^= bbox;
+}
 
     void render(const wf::scene::render_instruction_t &data) override {
       self->render_overview(data, workspace_captures);
@@ -1175,17 +1183,19 @@ class overview_render_node_t : public wf::scene::node_t {
     }
   };
 
-  overview_render_node_t(wf::output_t *output, activities_view_t *activities,
+ overview_render_node_t(wf::output_t *output, activities_view_t *activities,
                          OpenGL::program_t *tex_prog,
                          OpenGL::program_t *rounded_tex_prog,
-                         OpenGL::program_t *col_prog, GLuint wallpaper_tex)
+                         OpenGL::program_t *col_prog, GLuint wallpaper_tex,
+                         top_panel_t *panel)  // ADD panel parameter
       : node_t(false),
         output(output),
         activities(activities),
         tex_program(tex_prog),
         rounded_tex_program(rounded_tex_prog),
         col_program(col_prog),
-        wallpaper_texture(wallpaper_tex) {}
+        wallpaper_texture(wallpaper_tex),
+        panel(panel) {}  // ADD initialization
 
   void gen_render_instances(
       std::vector<wf::scene::render_instance_uptr> &instances,
@@ -1391,10 +1401,137 @@ class overview_render_node_t : public wf::scene::node_t {
           render_texture(data.target, tex.tex_id, desktop_geo, 1.0f, true);
         }
       }
+
+if (panel && panel->get_texture()) {
+    wf::geometry_t panel_geom = panel->get_panel_geometry();
+    render_texture(data.target, panel->get_texture(), panel_geom, 1.0f, true);
+}
+
+
     });
   }
+
+     
+
 };
 
+// Panel render node - only renders when its region is damaged
+class panel_render_node_t : public wf::scene::node_t
+{
+  public:
+    top_panel_t *panel;
+    wf::output_t *output;
+    OpenGL::program_t *tex_program;
+    bool *overview_active = nullptr;
+
+    class panel_render_instance_t : public wf::scene::render_instance_t
+    {
+        panel_render_node_t *self;
+        wf::scene::damage_callback push_damage;
+
+      public:
+        panel_render_instance_t(panel_render_node_t *self,
+            wf::scene::damage_callback push_damage)
+            : self(self), push_damage(push_damage)
+        {}
+
+void schedule_instructions(
+    std::vector<wf::scene::render_instruction_t>& instructions,
+    const wf::render_target_t& target, wf::region_t& damage) override
+{
+    // Skip if overview is handling panel rendering
+    if (self->overview_active && *self->overview_active) {
+        return;
+    }
+
+    auto bbox = self->get_bounding_box();
+    wf::region_t our_damage = damage & bbox;
+    
+    if (!our_damage.empty())
+    {
+        instructions.push_back(wf::scene::render_instruction_t{
+            .instance = this,
+            .target   = target,
+            .damage   = our_damage,
+        });
+    }
+}
+        void render(const wf::scene::render_instruction_t& data) override
+        {
+            self->render_panel(data.target);
+        }
+
+        void compute_visibility(wf::output_t*, wf::region_t&) override {}
+    };
+
+panel_render_node_t(wf::output_t *output, top_panel_t *panel, 
+                        OpenGL::program_t *tex_prog, bool *overview_active)
+        : node_t(false), output(output), panel(panel), tex_program(tex_prog),
+          overview_active(overview_active) {}
+
+    void gen_render_instances(
+        std::vector<wf::scene::render_instance_uptr>& instances,
+        wf::scene::damage_callback push_damage, wf::output_t *shown_on) override
+    {
+        if (shown_on != output)
+        {
+            return;
+        }
+        instances.push_back(std::make_unique<panel_render_instance_t>(this, push_damage));
+    }
+
+    wf::geometry_t get_bounding_box() override
+    {
+        return panel->get_panel_geometry();
+    }
+
+    void render_panel(const wf::render_target_t& target)
+    {
+            static int render_count = 0;
+    render_count++;
+    if (render_count % 100 == 1) {  // Log every 100th render
+        LOGI("Panel render #", render_count);
+    }
+        auto og = output->get_layout_geometry();
+        GLuint panel_tex = panel->get_texture();
+        if (!panel_tex)
+        {
+            return;
+        }
+
+        glm::mat4 ortho = glm::ortho<float>(
+            og.x, og.x + og.width, og.y + og.height, og.y, -1, 1);
+
+        wf::geometry_t panel_geom = panel->get_panel_geometry();
+
+        float x1 = panel_geom.x;
+        float x2 = panel_geom.x + panel_geom.width;
+        float y1 = panel_geom.y;
+        float y2 = panel_geom.y + panel_geom.height;
+
+        GLfloat vertexData[] = { x1, y1, x2, y1, x2, y2, x1, y2 };
+        GLfloat coordData[] = { 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f };
+
+        tex_program->use(wf::TEXTURE_TYPE_RGBA);
+        tex_program->uniformMatrix4f("matrix", ortho);
+        tex_program->uniform1i("smp", 0);
+        tex_program->uniform1f("alpha", 1.0f);
+
+        GL_CALL(glActiveTexture(GL_TEXTURE0));
+        GL_CALL(glBindTexture(GL_TEXTURE_2D, panel_tex));
+
+        tex_program->attrib_pointer("position", 2, 0, vertexData);
+        tex_program->attrib_pointer("uv", 2, 0, coordData);
+
+        GL_CALL(glEnable(GL_BLEND));
+        GL_CALL(glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA));
+        GL_CALL(glDrawArrays(GL_TRIANGLE_FAN, 0, 4));
+        GL_CALL(glDisable(GL_BLEND));
+
+        GL_CALL(glBindTexture(GL_TEXTURE_2D, 0));
+        tex_program->deactivate();
+    }
+};
 // ============================================================================
 // Per-output Instance - Fixed version
 // ============================================================================
@@ -1404,11 +1541,12 @@ class overview_output_t : public wf::per_output_plugin_instance_t {
   std::unique_ptr<top_panel_t> panel;
   std::unique_ptr<activities_view_t> activities;
   std::shared_ptr<overview_render_node_t> render_node;
+  std::shared_ptr<panel_render_node_t> panel_node;  // NEW: panel scene node
 
   wf::activator_callback toggle_cb;
   wf::wl_timer<false> clock_timer;
   wf::effect_hook_t pre_hook;
-  wf::effect_hook_t post_hook;
+  // REMOVED: wf::effect_hook_t post_hook;
 
   OpenGL::program_t tex_program;
   OpenGL::program_t rounded_tex_program;
@@ -1429,8 +1567,8 @@ class overview_output_t : public wf::per_output_plugin_instance_t {
   double overview_scale = 0.85;
   int spacing = 20;
 
-  // NEW: Track if we need to render panel this frame
-  bool panel_needs_render = true;
+  // Track if hooks are currently active
+  bool hooks_active = false;
 
   void load_wallpaper() {
     cairo_surface_t *img =
@@ -1476,25 +1614,8 @@ class overview_output_t : public wf::per_output_plugin_instance_t {
     wf::gles::run_in_context([&] { load_programs(); });
     load_wallpaper();
 
-    // PRE hook - only for animation management
+    // PRE hook - only for animation management (added dynamically)
     pre_hook = [this]() {
-      // This check runs EVERY frame
-      if (!activities->is_active && !activities->is_animating) {
-        if (render_node) {
-          wf::scene::remove_child(render_node);
-          render_node = nullptr;
-        }
-        return;  // Early return but still ran
-      }
-
-      // Add render node if not present
-      if (!render_node) {
-        render_node = std::make_shared<overview_render_node_t>(
-            output, activities.get(), &tex_program, &rounded_tex_program,
-            &col_program, wallpaper_texture);
-        wf::scene::add_front(wf::get_core().scene(), render_node);
-      }
-
       // Tick animations and check if still animating
       bool was_animating = activities->currently_animating();
       activities->tick_animations();
@@ -1502,32 +1623,99 @@ class overview_output_t : public wf::per_output_plugin_instance_t {
 
       // Only damage and schedule redraw if actually animating
       if (still_animating) {
-        wf::scene::damage_node(render_node, render_node->get_bounding_box());
+        if (render_node) {
+          wf::scene::damage_node(render_node, render_node->get_bounding_box());
+        }
         output->render->schedule_redraw();
       } else if (was_animating && !still_animating) {
         // Animation just finished - do one final damage
-        wf::scene::damage_node(render_node, render_node->get_bounding_box());
+        if (render_node) {
+          wf::scene::damage_node(render_node, render_node->get_bounding_box());
+        }
+
+        // Check if we're closing
+        if (!activities->is_active) {
+          deactivate_hooks();
+        }
       }
     };
-    output->render->add_effect(&pre_hook, wf::OUTPUT_EFFECT_PRE);
 
-    // POST hook - only renders panel, doesn't damage
-    post_hook = [this]() { render_panel_overlay(); };
-    output->render->add_effect(&post_hook, wf::OUTPUT_EFFECT_OVERLAY);
+// Create panel scene node (renders only when damaged)
+    panel_node = std::make_shared<panel_render_node_t>(
+        output, panel.get(), &tex_program, &activities->is_active);
+    wf::scene::add_front(wf::get_core().scene(), panel_node);
 
-    // Clock update timer - FIXED: damage only clock region
+    // Clock update timer - damage panel node
     clock_timer.set_timeout(60000, [this]() {
       if (panel->update_clock()) {
-        // Damage only the panel region, not the whole screen
-        output->render->damage(panel->get_panel_geometry());
+        wf::scene::damage_node(panel_node, panel_node->get_bounding_box());
       }
       return true;
     });
 
     // Initial damage for panel
-    output->render->damage(panel->get_panel_geometry());
+    wf::scene::damage_node(panel_node, panel_node->get_bounding_box());
 
     LOGI("Wayfire Overview output initialized");
+  }
+
+  // Activate hooks when overview opens
+void activate_hooks() {
+  if (hooks_active) {
+    return;
+  }
+
+  // Add render node
+  if (!render_node) {
+    render_node = std::make_shared<overview_render_node_t>(
+        output, activities.get(), &tex_program, &rounded_tex_program,
+        &col_program, wallpaper_texture, panel.get());  // ADD panel.get()
+    wf::scene::add_front(wf::get_core().scene(), render_node);
+  }
+
+  // Re-add panel node to front so it renders on top of overview
+  if (panel_node) {
+    wf::scene::remove_child(panel_node);
+    wf::scene::add_front(wf::get_core().scene(), panel_node);
+  }
+
+  // Add pre_hook for animation
+  output->render->add_effect(&pre_hook, wf::OUTPUT_EFFECT_PRE);
+  hooks_active = true;
+
+  LOGI("Overview hooks activated");
+}
+
+  // Deactivate hooks when overview closes
+  void deactivate_hooks() {
+    if (!hooks_active) {
+      return;
+    }
+
+    // Remove pre_hook
+    output->render->rem_effect(&pre_hook);
+    hooks_active = false;
+
+    // Remove render node
+    if (render_node) {
+      wf::scene::remove_child(render_node);
+      render_node = nullptr;
+    }
+
+    LOGI("Overview hooks deactivated");
+  }
+
+  // Called when toggle is triggered
+  void toggle_overview() {
+    activities->toggle();
+
+    if (activities->is_active) {
+      // Entering overview
+      activate_hooks();
+    }
+    // Note: deactivate_hooks() is called from pre_hook when animation finishes
+
+    output->render->damage_whole();
   }
 
   void load_programs() {
@@ -1627,66 +1815,24 @@ class overview_output_t : public wf::per_output_plugin_instance_t {
     col_program.compile(col_vert_src, col_frag_src);
   }
 
-  void render_panel_overlay() {
-    // Just render - don't damage or schedule redraws here
-    // The panel will be passively redrawn when other things damage its area
-
-    auto og = output->get_layout_geometry();
-
-    GLuint panel_tex = panel->get_texture();
-    if (!panel_tex) {
-      return;
+  void fini() override {
+    // Remove hooks if active
+    if (hooks_active) {
+      output->render->rem_effect(&pre_hook);
+      hooks_active = false;
     }
 
-    glm::mat4 ortho =
-        glm::ortho<float>(og.x, og.x + og.width, og.y + og.height, og.y, -1, 1);
-
-    wf::geometry_t panel_geom = {og.x, og.y + og.height - panel->panel_height,
-                                 panel->panel_width, panel->panel_height};
-
-    float x1 = panel_geom.x;
-    float x2 = panel_geom.x + panel_geom.width;
-    float y1 = panel_geom.y;
-    float y2 = panel_geom.y + panel_geom.height;
-
-    GLfloat vertexData[] = {
-        x1, y1, x2, y1, x2, y2, x1, y2,
-    };
-
-    GLfloat coordData[] = {
-        0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f,
-    };
-
-    tex_program.use(wf::TEXTURE_TYPE_RGBA);
-    tex_program.uniformMatrix4f("matrix", ortho);
-    tex_program.uniform1i("smp", 0);
-    tex_program.uniform1f("alpha", 1.0f);
-
-    GL_CALL(glActiveTexture(GL_TEXTURE0));
-    GL_CALL(glBindTexture(GL_TEXTURE_2D, panel_tex));
-
-    tex_program.attrib_pointer("position", 2, 0, vertexData);
-    tex_program.attrib_pointer("uv", 2, 0, coordData);
-
-    GL_CALL(glEnable(GL_BLEND));
-    GL_CALL(glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA));
-    GL_CALL(glDrawArrays(GL_TRIANGLE_FAN, 0, 4));
-    GL_CALL(glDisable(GL_BLEND));
-
-    GL_CALL(glBindTexture(GL_TEXTURE_2D, 0));
-    tex_program.deactivate();
-
-    // REMOVED: No more schedule_redraw() or damage_whole() here!
-  }
-
-  void fini() override {
     if (render_node) {
       wf::scene::remove_child(render_node);
       render_node = nullptr;
     }
 
-    output->render->rem_effect(&pre_hook);
-    output->render->rem_effect(&post_hook);
+    // Remove panel node
+    if (panel_node) {
+      wf::scene::remove_child(panel_node);
+      panel_node = nullptr;
+    }
+
     clock_timer.disconnect();
 
     wf::gles::run_in_context_if_gles([&] {
@@ -1703,9 +1849,6 @@ class overview_output_t : public wf::per_output_plugin_instance_t {
     panel.reset();
   }
 
-  // Fix handle_motion() to use output coordinates:
-
-  // In overview_output_t class:
   void handle_motion(wf::pointf_t cursor) {
     auto og = output->get_layout_geometry();
 
@@ -1715,12 +1858,12 @@ class overview_output_t : public wf::per_output_plugin_instance_t {
 
     if (in_panel_area) {
       if (panel->set_hover(panel->point_in_activities(cursor))) {
-        output->render->damage(panel->get_activities_geometry());
+        wf::scene::damage_node(panel_node, panel->get_activities_geometry());
       }
     } else if (panel->activities_hovered) {
       // Cursor left panel area, clear hover
       if (panel->set_hover(false)) {
-        output->render->damage(panel->get_activities_geometry());
+        wf::scene::damage_node(panel_node, panel->get_activities_geometry());
       }
     }
 
@@ -1733,8 +1876,10 @@ class overview_output_t : public wf::per_output_plugin_instance_t {
       activities->update_hover(local_cursor);
 
       if (old_hovered != activities->hovered_view) {
-        output->render->damage(
-            activities->get_screen_preview_geometry_output());
+        if (render_node) {
+          wf::scene::damage_node(render_node,
+              activities->get_screen_preview_geometry_output());
+        }
       }
     }
   }
@@ -1745,16 +1890,13 @@ class overview_output_t : public wf::per_output_plugin_instance_t {
     }
 
     if (panel->point_in_activities(cursor)) {
-      activities->toggle();
-      // Damage whole since we're entering/exiting overview
-      output->render->damage_whole();
+      toggle_overview();
       return true;
     }
 
     if (activities->is_active && !activities->currently_animating()) {
       bool handled = activities->handle_click(cursor);
       if (handled) {
-        // Starting exit animation - damage whole for the transition
         output->render->damage_whole();
       }
       return handled;
@@ -1841,8 +1983,7 @@ class wayfire_overview_t : public wf::plugin_interface_t {
 
     auto *ptr = inst.get();
     inst->toggle_cb = [ptr](auto) {
-      ptr->activities->toggle();
-      ptr->output->render->damage_whole();
+      ptr->toggle_overview();  // Use the new method
       return true;
     };
     output->add_activator(opt_toggle, &inst->toggle_cb);
