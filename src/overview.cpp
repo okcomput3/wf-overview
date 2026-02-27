@@ -6,6 +6,8 @@
  * - Click Activities (or press Super) to enter overview mode
  * - Windows animate smoothly to a grid layout using view transformers
  * - Click a window to focus it and exit overview
+ * - Drag a window to a workspace thumbnail to move it there
+ *   (window lifts out as a floating thumbnail, like GNOME Shell)
  *
  * Copyright (c) 2025
  * Licensed under MIT
@@ -79,7 +81,6 @@ public:
     auto now = std::chrono::steady_clock::now();
     float elapsed = std::chrono::duration<float, std::milli>(now - start_time).count();
     float t = std::clamp(elapsed / duration_ms, 0.0f, 1.0f);
-    // Ease-out cubic
     float ease = 1.0f - std::pow(1.0f - t, 3.0f);
     val = start + (goal - start) * ease;
     if (t >= 1.0f) { val = goal; animating = false; }
@@ -169,7 +170,6 @@ public:
 
   void render() {
     if (!cr) return;
-    // Parse color
     float r = 0.1f, g = 0.1f, b = 0.1f, a = 0.9f;
     if (color.length() >= 7 && color[0] == '#') {
       r = std::stoi(color.substr(1,2), nullptr, 16) / 255.0f;
@@ -187,7 +187,6 @@ public:
     PangoFontDescription *fd = pango_font_description_from_string(font);
     pango_layout_set_font_description(layout, fd);
 
-    // Activities
     pango_layout_set_text(layout, "Activities", -1);
     int tw, th; pango_layout_get_pixel_size(layout, &tw, &th);
     int ax = 8, ay = (height - th) / 2;
@@ -201,7 +200,6 @@ public:
     cairo_move_to(cr, ax, ay);
     pango_cairo_show_layout(cr, layout);
 
-    // Clock
     time_t now = time(nullptr);
     char ts[64]; strftime(ts, sizeof(ts), "%a %b %d  %H:%M", localtime(&now));
     pango_layout_set_text(layout, ts, -1);
@@ -229,10 +227,9 @@ public:
 
   wf::geometry_t get_geometry() const {
     auto og = output->get_layout_geometry();
-    return {og.x, og.y, width, height};  // Top of screen
+    return {og.x, og.y, width, height};
   }
   
-  // For GL rendering (Y is flipped)
   wf::geometry_t get_render_geometry() const {
     auto og = output->get_layout_geometry();
     return {og.x, og.y + og.height - height, width, height};
@@ -249,6 +246,36 @@ public:
     int lx = p.x - og.x, ly = p.y - og.y;
     return lx >= activities_bounds.x && lx < activities_bounds.x + activities_bounds.width &&
            ly >= 0 && ly < height;
+  }
+};
+
+// ============================================================================
+// Drag State
+// ============================================================================
+
+struct drag_state_t {
+  bool active = false;
+  wayfire_toplevel_view view = nullptr;
+  int slot_index = -1;
+  wf::pointf_t grab_cursor{0, 0};        // Cursor at grab time (output-local screen coords)
+  wf::pointf_t current_cursor{0, 0};     // Current cursor (output-local screen coords)
+  wf::geometry_t initial_screen_geo{};    // Window screen position at grab time (output-local, Y-down)
+  int hover_ws = -1;                      // Workspace thumbnail under cursor
+
+  // Floating snapshot — the window texture rendered above everything
+  wf::auxilliary_buffer_t snapshot_fb;
+  bool has_snapshot = false;
+  bool needs_capture = false;             // Set on drag start, consumed by render pipeline
+  int float_width = 0, float_height = 0; // Size to draw the floating thumbnail (screen pixels)
+  wf::geometry_t view_geo{};             // Original view geometry (for snapshot capture)
+
+  void reset() {
+    active = false;
+    view = nullptr;
+    slot_index = -1;
+    hover_ws = -1;
+    has_snapshot = false;
+    needs_capture = false;
   }
 };
 
@@ -270,6 +297,7 @@ public:
   int pending_ws = -1;
   bool is_active = false, is_animating = false, transformers_attached = false;
   int corner_radius = 12, spacing = 20, panel_height = 16, anim_duration = 300;
+  drag_state_t drag;
 
   activities_view_t(wf::output_t *out) : output(out) { desktop_anim.set_duration(anim_duration); }
   ~activities_view_t() { cleanup(); }
@@ -285,6 +313,7 @@ public:
     if (is_active) return;
     is_active = is_animating = true;
     transformers_attached = false;
+    drag.reset();
 
     auto wsize = output->wset()->get_workspace_grid_size();
     ws_cols = wsize.width; ws_rows = wsize.height;
@@ -312,6 +341,7 @@ public:
 
   void deactivate() {
     if (!is_active) return;
+    drag.reset();
     is_animating = true;
     for (auto &s : slots) s.start_anim(false, anim_duration);
     auto og = output->get_layout_geometry();
@@ -320,6 +350,7 @@ public:
 
   void deactivate_to_ws(int idx) {
     if (!is_active) return;
+    drag.reset();
     pending_ws = idx; switching_ws = true;
     if (idx >= 0 && idx < (int)ws_geos.size()) desktop_anim.warp(ws_geos[idx]);
     cleanup();
@@ -419,13 +450,46 @@ public:
     }
   }
 
-  wayfire_toplevel_view find_view_at(wf::pointf_t p) {
+  // Convert output-local screen coords to workspace coords.
+  //
+  // anim.current() positions are in compositor/screen coords (Y-down), same as
+  // view->get_geometry(). The workspace stream captures at these positions, and
+  // the texture flip_y + display pipeline flip cancel each other out within the
+  // preview, so the mapping is a simple linear scale through the preview rect.
+  //
+  // dg = desktop_anim.current() = the preview rectangle in output-local coords.
+  // A window at workspace (wx, wy) appears on screen at:
+  //   screen_x = dg.x + wx * dg.width / og.width
+  //   screen_y = dg.y + wy * dg.height / og.height
+  // Inverting gives:
+  wf::pointf_t screen_to_workspace(wf::pointf_t screen_local) {
+    auto og = output->get_layout_geometry();
+    auto dg = desktop_anim.current();
+    if (dg.width <= 0 || dg.height <= 0) return screen_local;
+    return {
+      (screen_local.x - dg.x) * (float)og.width / dg.width,
+      (screen_local.y - dg.y) * (float)og.height / dg.height
+    };
+  }
+
+  wayfire_toplevel_view find_view_at(wf::pointf_t screen_local) {
+    auto p = screen_to_workspace(screen_local);
     for (auto it = slots.rbegin(); it != slots.rend(); ++it) {
       auto g = it->anim.current();
       if (p.x >= g.x && p.x < g.x + g.width && p.y >= g.y && p.y < g.y + g.height)
         return it->view;
     }
     return nullptr;
+  }
+
+  int find_slot_at(wf::pointf_t screen_local) {
+    auto p = screen_to_workspace(screen_local);
+    for (int i = (int)slots.size() - 1; i >= 0; i--) {
+      auto g = slots[i].anim.current();
+      if (p.x >= g.x && p.x < g.x + g.width && p.y >= g.y && p.y < g.y + g.height)
+        return i;
+    }
+    return -1;
   }
 
   int find_ws_at(wf::pointf_t p) {
@@ -437,6 +501,145 @@ public:
         return i;
     }
     return -1;
+  }
+
+  // ---- Drag-and-drop with floating snapshot ----
+
+  bool start_drag(wf::pointf_t local_p) {
+    if (drag.active) return false;
+    int idx = find_slot_at(local_p);
+    if (idx < 0) return false;
+
+    auto &s = slots[idx];
+    auto cur = s.anim.current();  // Window position in workspace/overview coords
+
+    drag.active = true;
+    drag.view = s.view;
+    drag.slot_index = idx;
+    drag.grab_cursor = local_p;
+    drag.current_cursor = local_p;
+    drag.hover_ws = -1;
+
+    // Map workspace position to output-local screen coords.
+    // Same linear mapping as screen_to_workspace but inverted:
+    //   screen = dg_origin + ws_pos * dg_size / og_size
+    auto og_dim = output->get_layout_geometry();
+    auto dg = desktop_anim.current();
+    float sx = (float)dg.width / og_dim.width;
+    float sy = (float)dg.height / og_dim.height;
+
+    drag.initial_screen_geo = {
+      (int)(dg.x + cur.x * sx),
+      (int)(dg.y + cur.y * sy),
+      (int)(cur.width * sx),
+      (int)(cur.height * sy)
+    };
+
+    // Floating thumbnail matches the visible size in the preview
+    drag.float_width = drag.initial_screen_geo.width;
+    drag.float_height = drag.initial_screen_geo.height;
+    drag.view_geo = s.orig_geo;
+
+    // Request snapshot capture — the render pipeline will handle it in GL context
+    drag.needs_capture = true;
+    drag.has_snapshot = false;
+
+    return true;
+  }
+
+  void update_drag(wf::pointf_t local_p, wf::pointf_t global_p) {
+    if (!drag.active) return;
+    drag.current_cursor = local_p;
+    drag.hover_ws = find_ws_at(global_p);
+  }
+
+  bool end_drag(wf::pointf_t global_p) {
+    if (!drag.active) return false;
+
+    int target_ws = find_ws_at(global_p);
+    int cur_ws_idx = cur_ws.y * ws_cols + cur_ws.x;
+
+    if (target_ws >= 0 && target_ws != cur_ws_idx && drag.view) {
+      // Move the view to the target workspace
+      move_view_to_workspace(drag.view, target_ws);
+
+      // Remove the dragged view from slots and clean up its transformer
+      if (drag.slot_index >= 0 && drag.slot_index < (int)slots.size()) {
+        auto &s = slots[drag.slot_index];
+        if (s.view && s.view->is_mapped() && s.transformer) {
+          s.reset_transformer();
+          s.view->get_transformed_node()->rem_transformer(TRANSFORMER_NAME);
+        }
+        slots.erase(slots.begin() + drag.slot_index);
+      }
+
+      drag.reset();
+      rearrange_after_remove();
+      return true;
+    }
+
+    // No valid drop — snap back: restore window visibility in workspace stream
+    if (drag.slot_index >= 0 && drag.slot_index < (int)slots.size()) {
+      auto &s = slots[drag.slot_index];
+      // Restore transformer alpha so the window reappears in the workspace capture
+      if (s.transformer) {
+        s.transformer->alpha = 0.92f;
+      }
+      s.anim.set_duration(anim_duration);
+      s.anim.animate_to(s.target_geo);
+      is_animating = true;
+    }
+
+    drag.reset();
+    return false;
+  }
+
+  void cancel_drag() {
+    if (!drag.active) return;
+    if (drag.slot_index >= 0 && drag.slot_index < (int)slots.size()) {
+      auto &s = slots[drag.slot_index];
+      if (s.transformer) s.transformer->alpha = 0.92f;
+      s.anim.set_duration(anim_duration);
+      s.anim.animate_to(s.target_geo);
+      is_animating = true;
+    }
+    drag.reset();
+  }
+
+  void move_view_to_workspace(wayfire_toplevel_view view, int ws_idx) {
+    if (!view || !view->is_mapped()) return;
+    int tx = ws_idx % ws_cols, ty = ws_idx / ws_cols;
+    auto og = output->get_layout_geometry();
+    int dx = (tx - cur_ws.x) * og.width;
+    int dy = (ty - cur_ws.y) * og.height;
+    auto vg = view->get_geometry();
+    view->move(vg.x + dx, vg.y + dy);
+  }
+
+  void rearrange_after_remove() {
+    if (slots.empty()) return;
+    int waw = preview_geo.width - spacing * 4;
+    int wah = preview_geo.height - spacing * 4;
+    int cols = std::ceil(std::sqrt(slots.size() * 1.5));
+    int rows = std::ceil((double)slots.size() / cols);
+    int cw = (waw - spacing * (cols - 1)) / cols;
+    int ch = (wah - spacing * (rows - 1)) / rows;
+    int gw = cols * cw + (cols - 1) * spacing;
+    int gh = rows * ch + (rows - 1) * spacing;
+    int gx = preview_geo.x + (preview_geo.width - gw) / 2;
+    int gy = preview_geo.y + (preview_geo.height - gh) / 2;
+
+    for (size_t i = 0; i < slots.size(); i++) {
+      auto &s = slots[i];
+      int col = i % cols, row = i / cols;
+      int cx = gx + col * (cw + spacing), cy = gy + row * (ch + spacing);
+      double sc = std::min((double)cw / s.orig_geo.width, (double)ch / s.orig_geo.height) * 0.85;
+      int sw = s.orig_geo.width * sc, sh = s.orig_geo.height * sc;
+      s.target_geo = {cx + (cw - sw) / 2, cy + (ch - sh) / 2, sw, sh};
+      s.anim.set_duration(anim_duration);
+      s.anim.animate_to(s.target_geo);
+    }
+    is_animating = true;
   }
 
   bool handle_click(wf::pointf_t p) {
@@ -453,6 +656,7 @@ public:
   }
 
   void update_hover(wf::pointf_t p) {
+    if (drag.active) return;
     auto nv = find_view_at(p);
     if (nv != hovered_view) {
       for (auto &s : slots) s.hovered = (s.view == nv);
@@ -550,7 +754,7 @@ inline void render_rect(OpenGL::program_t &prog, wf::output_t *out, wf::geometry
 }
 
 // ============================================================================
-// Panel Render Node (for when overview is inactive)
+// Panel Render Node
 // ============================================================================
 
 class panel_node_t : public wf::scene::node_t {
@@ -562,12 +766,13 @@ public:
 
   class instance_t : public wf::scene::render_instance_t {
     panel_node_t *self;
+    wf::scene::damage_callback push_damage;
   public:
-    instance_t(panel_node_t *s, wf::scene::damage_callback) : self(s) {}
+    instance_t(panel_node_t *s, wf::scene::damage_callback pd) : self(s), push_damage(pd) {}
     
     void schedule_instructions(std::vector<wf::scene::render_instruction_t> &instr, 
                                const wf::render_target_t &target, wf::region_t &damage) override {
-      if (self->overview_active && *self->overview_active) return;  // Overview draws panel
+      if (self->overview_active && *self->overview_active) return;
       auto bbox = self->get_bounding_box();
       wf::region_t our_damage = damage & bbox;
       if (!our_damage.empty()) {
@@ -643,17 +848,85 @@ public:
       }
     }
 
-    void schedule_instructions(std::vector<wf::scene::render_instruction_t> &instr, const wf::render_target_t &target, wf::region_t &damage) override {
+    // Capture the dragged window into a snapshot FBO (called in GL context)
+    void capture_drag_snapshot(float scale) {
+      auto &drg = self->activities->drag;
+      if (!drg.needs_capture || drg.slot_index < 0) return;
+      if (drg.slot_index >= (int)self->activities->slots.size()) return;
+
+      auto &s = self->activities->slots[drg.slot_index];
+      if (!s.view || !s.view->is_mapped() || !s.transformer) {
+        drg.needs_capture = false;
+        return;
+      }
+
+      auto geo = drg.view_geo;
+      if (geo.width <= 0 || geo.height <= 0) { drg.needs_capture = false; return; }
+
+      // Allocate the snapshot framebuffer at the view's full resolution
+      drg.snapshot_fb.allocate({geo.width, geo.height}, scale);
+
+      // Temporarily reset the transformer to identity so the view renders normally
+      float save_alpha = s.transformer->alpha;
+      float save_sx = s.transformer->scale_x;
+      float save_sy = s.transformer->scale_y;
+      float save_tx = s.transformer->translation_x;
+      float save_ty = s.transformer->translation_y;
+
+      s.transformer->alpha = 1.0f;
+      s.transformer->scale_x = 1.0f;
+      s.transformer->scale_y = 1.0f;
+      s.transformer->translation_x = 0;
+      s.transformer->translation_y = 0;
+
+      // Generate render instances for the view and render into our snapshot
+      std::vector<wf::scene::render_instance_uptr> view_insts;
+      s.view->get_transformed_node()->gen_render_instances(
+        view_insts, [](const wf::region_t&){}, self->output);
+
+      wf::render_target_t snap_target{drg.snapshot_fb};
+      snap_target.geometry = geo;
+      snap_target.scale = scale;
+
+      wf::render_pass_params_t snap_params;
+      snap_params.instances = &view_insts;
+      snap_params.damage = wf::region_t{geo};
+      snap_params.reference_output = self->output;
+      snap_params.target = snap_target;
+      snap_params.flags = wf::RPASS_CLEAR_BACKGROUND;
+      wf::render_pass_t::run(snap_params);
+
+      // Now hide the window from the workspace stream by making it invisible
+      s.transformer->alpha = 0.001f;
+      // Keep the other transform values so it stays "in place" but invisible
+      s.transformer->scale_x = save_sx;
+      s.transformer->scale_y = save_sy;
+      s.transformer->translation_x = save_tx;
+      s.transformer->translation_y = save_ty;
+
+      drg.needs_capture = false;
+      drg.has_snapshot = true;
+    }
+
+    void schedule_instructions(std::vector<wf::scene::render_instruction_t> &instr,
+                               const wf::render_target_t &target, wf::region_t &damage) override {
       auto bbox = self->get_bounding_box();
       float scale = self->output->handle->scale;
-      bool anim = self->activities->is_animating;
+
+      // If a drag just started, capture the window snapshot BEFORE workspace captures
+      // This ensures the window is captured while still visible, then hidden for ws renders
+      if (self->activities->drag.needs_capture) {
+        capture_drag_snapshot(scale);
+      }
+
+      bool force_full = self->activities->is_animating || self->activities->drag.active;
       for (auto &c : captures) {
         auto ws_box = c.stream->get_bounding_box();
         c.fb.allocate(wf::dimensions(ws_box), scale);
         wf::render_target_t t{c.fb}; t.geometry = ws_box; t.scale = scale;
         wf::render_pass_params_t p;
         p.instances = &c.instances;
-        p.damage = anim ? wf::region_t{ws_box} : c.damage;
+        p.damage = force_full ? wf::region_t{ws_box} : c.damage;
         p.reference_output = self->output; p.target = t;
         p.flags = wf::RPASS_CLEAR_BACKGROUND | wf::RPASS_EMIT_SIGNALS;
         wf::render_pass_t::run(p);
@@ -686,6 +959,7 @@ public:
 
       int aws = activities->get_animating_ws();
       float cr = activities->corner_radius;
+      auto &drg = activities->drag;
 
       // Wallpaper + overlay
       if (wallpaper_tex) {
@@ -699,7 +973,18 @@ public:
       for (size_t i = 0; i < wsg.size() && i < caps.size(); i++) {
         wf::geometry_t g = {og.x + wsg[i].x, og.y + wsg[i].y, wsg[i].width, wsg[i].height};
         float a = ((int)i == aws) ? 1.0f : 0.7f;
+
+        if (drg.active && drg.hover_ws == (int)i && (int)i != aws) {
+          a = 1.0f;
+        }
+
         auto t = wf::gles_texture_t::from_aux(caps[i].fb);
+
+        if (drg.active && drg.hover_ws == (int)i && (int)i != aws) {
+          wf::geometry_t border = {g.x - 2, g.y - 2, g.width + 4, g.height + 4};
+          render_rect(progs->col, output, border, {0.4f, 0.6f, 1.0f, 0.5f});
+        }
+
         render_rounded(progs->rounded, output, t.tex_id, g, a, cr * 0.5f, true);
       }
 
@@ -717,6 +1002,39 @@ public:
       // Panel
       if (panel && panel->tex_id) {
         render_tex(progs->tex, output, panel->tex_id, panel->get_render_geometry(), 1.0f, true);
+      }
+
+      // ---- Floating drag thumbnail (rendered LAST, on top of everything) ----
+      if (drg.active && drg.has_snapshot && drg.float_width > 0 && drg.float_height > 0) {
+        auto snap_t = wf::gles_texture_t::from_aux(drg.snapshot_fb);
+
+        // Compute current screen-local center (Y-down, matching cursor coords)
+        float screen_dx = drg.current_cursor.x - drg.grab_cursor.x;
+        float screen_dy = drg.current_cursor.y - drg.grab_cursor.y;
+
+        float screen_cx = drg.initial_screen_geo.x + drg.initial_screen_geo.width / 2.0f + screen_dx;
+        float screen_cy = drg.initial_screen_geo.y + drg.initial_screen_geo.height / 2.0f + screen_dy;
+
+        int fw = drg.float_width;
+        int fh = drg.float_height;
+
+        // Convert screen-local to render coords for GL.
+        // X is the same. Render Y is inverted from screen Y.
+        float render_cx = screen_cx;
+        float render_cy = og.height - screen_cy;
+
+        wf::geometry_t float_box = {
+          og.x + (int)(render_cx - fw / 2.0f),
+          og.y + (int)(render_cy - fh / 2.0f),
+          fw, fh
+        };
+
+        // Drop shadow
+        wf::geometry_t shadow = {float_box.x + 4, float_box.y - 4, fw, fh};
+        render_rect(progs->col, output, shadow, {0, 0, 0, 0.35f});
+
+        // The floating window thumbnail with rounded corners
+        render_rounded(progs->rounded, output, snap_t.tex_id, float_box, 0.95f, cr, true);
       }
     });
   }
@@ -741,6 +1059,11 @@ public:
   bool hooks_active = false;
   int panel_height = 16, corner_radius = 12, spacing = 20, anim_duration = 300;
   std::string panel_color = "#1a1a1aE6";
+
+  bool button_held = false;
+  wf::pointf_t press_pos{0, 0};
+  bool drag_started = false;
+  static constexpr float DRAG_THRESHOLD = 8.0f;
 
   void load_wallpaper() {
     if (wallpaper_path.empty()) return;
@@ -767,25 +1090,27 @@ public:
     load_wallpaper();
 
     pre_hook = [this]() {
-      bool was = activities->is_animating;
+      bool was_animating = activities->is_animating;
+      bool was_dragging = activities->drag.active;
       activities->tick();
-      bool still = activities->is_animating;
-      if (still) {
+      bool still_animating = activities->is_animating;
+      bool still_dragging = activities->drag.active;
+
+      if (still_animating || still_dragging) {
         if (render_node) wf::scene::damage_node(render_node, render_node->get_bounding_box());
         output->render->schedule_redraw();
-      } else if (was && !still && !activities->is_active) {
-        if (render_node) wf::scene::damage_node(render_node, render_node->get_bounding_box());
+      } else if ((was_animating || was_dragging) && !still_animating && !activities->is_active) {
+        output->render->damage_whole();
         deactivate_hooks();
       }
     };
 
     clock_timer.set_timeout(60000, [this]() { 
       panel->render(); panel->upload(); 
-      wf::scene::damage_node(panel_node, panel_node->get_bounding_box());
+      if (panel_node) wf::scene::damage_node(panel_node, panel_node->get_bounding_box());
       return true; 
     });
     
-    // Create panel scene node
     panel_node = std::make_shared<panel_node_t>(output, panel.get(), &progs, &activities->is_active);
     wf::scene::add_front(wf::get_core().scene(), panel_node);
     wf::scene::damage_node(panel_node, panel_node->get_bounding_box());
@@ -797,13 +1122,13 @@ public:
       render_node = std::make_shared<overview_node_t>(output, activities.get(), &progs, wallpaper_tex, panel.get());
       wf::scene::add_front(wf::get_core().scene(), render_node);
     }
-    // Re-add panel node to front so it's above overview
     if (panel_node) {
       wf::scene::remove_child(panel_node);
       wf::scene::add_front(wf::get_core().scene(), panel_node);
     }
     output->render->add_effect(&pre_hook, wf::OUTPUT_EFFECT_PRE);
     hooks_active = true;
+    output->render->damage_whole();
   }
 
   void deactivate_hooks() {
@@ -811,6 +1136,10 @@ public:
     output->render->rem_effect(&pre_hook);
     hooks_active = false;
     if (render_node) { wf::scene::remove_child(render_node); render_node = nullptr; }
+    if (panel_node) wf::scene::damage_node(panel_node, panel_node->get_bounding_box());
+    output->render->damage_whole();
+    button_held = false;
+    drag_started = false;
   }
 
   void toggle() {
@@ -833,28 +1162,84 @@ public:
 
   void handle_motion(wf::pointf_t cursor) {
     auto og = output->get_layout_geometry();
+
     bool in_panel = cursor.y >= og.y && cursor.y < og.y + panel->height;
     if (in_panel) {
       if (panel->set_hover(panel->point_in_activities(cursor)))
         wf::scene::damage_node(panel_node, panel_node->get_bounding_box());
     } else if (panel->activities_hovered) {
-      if (panel->set_hover(false)) 
+      if (panel->set_hover(false))
         wf::scene::damage_node(panel_node, panel_node->get_bounding_box());
     }
+
     if (activities->is_active && !activities->is_animating) {
-      auto old = activities->hovered_view;
-      activities->update_hover({cursor.x - og.x, cursor.y - og.y});
-      if (old != activities->hovered_view && render_node)
-        wf::scene::damage_node(render_node, activities->get_preview_geo_output());
+      wf::pointf_t local = {cursor.x - og.x, cursor.y - og.y};
+
+      if (button_held && !drag_started) {
+        float dx = cursor.x - press_pos.x;
+        float dy = cursor.y - press_pos.y;
+        if (std::sqrt(dx*dx + dy*dy) > DRAG_THRESHOLD) {
+          wf::pointf_t press_local = {press_pos.x - og.x, press_pos.y - og.y};
+          drag_started = activities->start_drag(press_local);
+        }
+      }
+
+      if (drag_started && activities->drag.active) {
+        activities->update_drag(local, cursor);
+        if (render_node) {
+          wf::scene::damage_node(render_node, render_node->get_bounding_box());
+          output->render->schedule_redraw();
+        }
+      } else {
+        auto old = activities->hovered_view;
+        activities->update_hover(local);
+        if (old != activities->hovered_view && render_node)
+          wf::scene::damage_node(render_node, activities->get_preview_geo_output());
+      }
     }
   }
 
   bool handle_button(uint32_t btn, uint32_t state, wf::pointf_t cursor) {
-    if (btn != BTN_LEFT || state != WL_POINTER_BUTTON_STATE_PRESSED) return false;
-    if (panel->point_in_activities(cursor)) { toggle(); return true; }
-    if (activities->is_active && !activities->is_animating) {
-      if (activities->handle_click(cursor)) { output->render->damage_whole(); return true; }
+    if (btn != BTN_LEFT) return false;
+
+    if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
+      if (panel->point_in_activities(cursor)) { toggle(); return true; }
+      if (activities->is_active && !activities->is_animating) {
+        button_held = true;
+        press_pos = cursor;
+        drag_started = false;
+        return true;
+      }
+      return false;
     }
+
+    if (state == WL_POINTER_BUTTON_STATE_RELEASED) {
+      bool was_dragging = drag_started && activities->drag.active;
+      bool was_held = button_held;
+      button_held = false;
+
+      if (was_dragging) {
+        activities->end_drag(cursor);
+        drag_started = false;
+        if (render_node) {
+          wf::scene::damage_node(render_node, render_node->get_bounding_box());
+          output->render->schedule_redraw();
+        }
+        output->render->damage_whole();
+        return true;
+      }
+
+      drag_started = false;
+
+      if (was_held && activities->is_active && !activities->is_animating) {
+        if (activities->handle_click(cursor)) {
+          output->render->damage_whole();
+          return true;
+        }
+      }
+      return false;
+    }
+
     return false;
   }
 };
