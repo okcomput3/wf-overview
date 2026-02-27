@@ -269,6 +269,8 @@ struct drag_state_t {
   int float_width = 0, float_height = 0; // Size to draw the floating thumbnail (screen pixels)
   wf::geometry_t view_geo{};             // Original view geometry (for snapshot capture)
 
+  wf::pointf_t grab_offset_in_window{0, 0}; 
+
   void reset() {
     active = false;
     view = nullptr;
@@ -450,25 +452,27 @@ public:
     }
   }
 
-  // Convert output-local screen coords to workspace coords.
+  // Convert output-local screen coords (Y-down) to workspace coords.
   //
-  // anim.current() positions are in compositor/screen coords (Y-down), same as
-  // view->get_geometry(). The workspace stream captures at these positions, and
-  // the texture flip_y + display pipeline flip cancel each other out within the
-  // preview, so the mapping is a simple linear scale through the preview rect.
+  // The overview renders the workspace stream texture into the desktop preview
+  // rectangle using an orthographic GL projection.  Because Wayfire's final
+  // output blit flips Y (GL framebuffer row 0 is at the bottom, but scanout
+  // row 0 is at the top), a render-coordinate position R appears on screen at
+  // screen_y = og.height - R.  Accounting for this flip plus the flip_y on
+  // the texture UV, a workspace pixel at (wx, wy) ends up on screen at:
   //
-  // dg = desktop_anim.current() = the preview rectangle in output-local coords.
-  // A window at workspace (wx, wy) appears on screen at:
-  //   screen_x = dg.x + wx * dg.width / og.width
-  //   screen_y = dg.y + wy * dg.height / og.height
+  //   screen_y = og.height - dg.y - dg.height + dg.height * wy / og.height
+  //
   // Inverting gives:
+  //   wy = (screen_y - og.height + dg.y + dg.height) * og.height / dg.height
+  //
   wf::pointf_t screen_to_workspace(wf::pointf_t screen_local) {
     auto og = output->get_layout_geometry();
     auto dg = desktop_anim.current();
     if (dg.width <= 0 || dg.height <= 0) return screen_local;
     return {
       (screen_local.x - dg.x) * (float)og.width / dg.width,
-      (screen_local.y - dg.y) * (float)og.height / dg.height
+      (screen_local.y - (float)og.height + dg.y + dg.height) * (float)og.height / dg.height
     };
   }
 
@@ -520,9 +524,13 @@ public:
     drag.current_cursor = local_p;
     drag.hover_ws = -1;
 
-    // Map workspace position to output-local screen coords.
-    // Same linear mapping as screen_to_workspace but inverted:
-    //   screen = dg_origin + ws_pos * dg_size / og_size
+    // Map workspace position to output-local screen coords (Y-down).
+    //
+    // A workspace pixel at (wx, wy) appears on screen at:
+    //   screen_x = dg.x + wx * dg.width / og.width
+    //   screen_y = og.height - dg.y - dg.height + wy * dg.height / og.height
+    //
+    // (The Y formula accounts for the GL framebuffer → scanout Y flip.)
     auto og_dim = output->get_layout_geometry();
     auto dg = desktop_anim.current();
     float sx = (float)dg.width / og_dim.width;
@@ -530,15 +538,23 @@ public:
 
     drag.initial_screen_geo = {
       (int)(dg.x + cur.x * sx),
-      (int)(dg.y + cur.y * sy),
+      (int)((float)og_dim.height - dg.y - dg.height + cur.y * sy),
       (int)(cur.width * sx),
       (int)(cur.height * sy)
     };
 
     // Floating thumbnail matches the visible size in the preview
-    drag.float_width = drag.initial_screen_geo.width;
+    drag.float_width  = drag.initial_screen_geo.width;
     drag.float_height = drag.initial_screen_geo.height;
     drag.view_geo = s.orig_geo;
+
+    // Record where within the window the cursor grabbed (screen-local coords).
+    // This keeps the thumbnail locked under the grab point instead of
+    // snapping its center to the cursor.
+    drag.grab_offset_in_window = {
+      local_p.x - (float)drag.initial_screen_geo.x,
+      local_p.y - (float)drag.initial_screen_geo.y
+    };
 
     // Request snapshot capture — the render pipeline will handle it in GL context
     drag.needs_capture = true;
