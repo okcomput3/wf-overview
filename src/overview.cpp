@@ -4,9 +4,12 @@
  * A GNOME Shell-like experience for Wayfire:
  * - Top panel with Activities button, clock
  * - Click Activities (or press Super) to enter overview mode
+ * - GNOME-like horizontal workspace carousel: adjacent workspaces visible as
+ *   large previews to the left/right of the focused workspace
+ * - Click on an adjacent large preview to navigate (slides carousel)
  * - Windows animate smoothly to a grid layout using view transformers
  * - Click a window to focus it and exit overview
- * - Drag a window to a workspace thumbnail to move it there
+ * - Drag a window to a workspace (large preview OR small thumbnail) to move it
  * - App icon overlay at bottom of each window (on the window, not below)
  *
  * Copyright (c) 2025
@@ -99,7 +102,7 @@ struct anim_geo_t {
 };
 
 // ============================================================================
-// Icon Texture — loads app icon from system icon theme, with fallback
+// Icon Texture
 // ============================================================================
 
 static bool file_exists(const std::string &p) {
@@ -107,7 +110,6 @@ static bool file_exists(const std::string &p) {
   return stat(p.c_str(), &st) == 0;
 }
 
-// Parse a .desktop file to find the Icon= key
 static std::string icon_from_desktop_file(const std::string &path) {
   std::ifstream f(path);
   if (!f.is_open()) return "";
@@ -122,7 +124,6 @@ static std::string icon_from_desktop_file(const std::string &path) {
   return "";
 }
 
-// Search for the .desktop file matching an app_id
 static std::string find_icon_name_for_app(const std::string &app_id) {
   std::vector<std::string> dirs = {"/usr/share/applications", "/usr/local/share/applications"};
   const char *home = getenv("HOME");
@@ -167,7 +168,6 @@ struct icon_tex_t {
     int sw = cairo_image_surface_get_width(src);
     int sh = cairo_image_surface_get_height(src);
     width = height = target_size;
-
     auto scaled = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width, height);
     auto cr = cairo_create(scaled);
     double sc = (double)target_size / std::max(sw, sh);
@@ -180,7 +180,6 @@ struct icon_tex_t {
     cairo_paint(cr);
     cairo_destroy(cr);
     cairo_surface_flush(scaled);
-
     auto data = cairo_image_surface_get_data(scaled);
     glGenTextures(1, &tex_id);
     glBindTexture(GL_TEXTURE_2D, tex_id);
@@ -194,9 +193,7 @@ struct icon_tex_t {
   bool try_load_png(const std::string &path, int target_size) {
     if (!file_exists(path)) return false;
     auto surf = cairo_image_surface_create_from_png(path.c_str());
-    if (cairo_surface_status(surf) != CAIRO_STATUS_SUCCESS) {
-      cairo_surface_destroy(surf); return false;
-    }
+    if (cairo_surface_status(surf) != CAIRO_STATUS_SUCCESS) { cairo_surface_destroy(surf); return false; }
     upload_surface(surf, target_size);
     cairo_surface_destroy(surf);
     return true;
@@ -205,28 +202,20 @@ struct icon_tex_t {
   bool load_icon_by_name(const std::string &icon_name, int target_size) {
     if (icon_name.empty()) return false;
     if (icon_name[0] == '/') return try_load_png(icon_name, target_size);
-
     static const char *sizes[] = {"256x256","128x128","96x96","64x64","48x48","32x32","scalable"};
     static const char *themes[] = {"hicolor","Adwaita","breeze","gnome","Papirus"};
     static const char *bases[] = {"/usr/share/icons", "/usr/local/share/icons"};
-
-    for (auto base : bases) {
-      for (auto theme : themes) {
-        for (auto sz : sizes) {
-          std::string cat = (std::string(sz) == "scalable") ? "scalable" : sz;
-          std::string path = std::string(base) + "/" + theme + "/" + cat + "/apps/" + icon_name + ".png";
-          if (try_load_png(path, target_size)) return true;
-          for (auto sub : {"apps", "mimetypes", "categories", "places"}) {
-            path = std::string(base) + "/" + theme + "/" + cat + "/" + sub + "/" + icon_name + ".png";
-            if (try_load_png(path, target_size)) return true;
-          }
-        }
+    for (auto base : bases) for (auto theme : themes) for (auto sz : sizes) {
+      std::string cat = (std::string(sz) == "scalable") ? "scalable" : sz;
+      std::string path = std::string(base) + "/" + theme + "/" + cat + "/apps/" + icon_name + ".png";
+      if (try_load_png(path, target_size)) return true;
+      for (auto sub : {"apps", "mimetypes", "categories", "places"}) {
+        path = std::string(base) + "/" + theme + "/" + cat + "/" + sub + "/" + icon_name + ".png";
+        if (try_load_png(path, target_size)) return true;
       }
     }
-
     std::string pixmap = "/usr/share/pixmaps/" + icon_name + ".png";
-    if (try_load_png(pixmap, target_size)) return true;
-    return false;
+    return try_load_png(pixmap, target_size);
   }
 
   bool load_for_app(const std::string &app_id, int target_size) {
@@ -239,8 +228,7 @@ struct icon_tex_t {
     std::string alt = app_id;
     for (auto &c : alt) { if (c == '.') c = '-'; }
     if (alt != app_id && load_icon_by_name(alt, target_size)) return true;
-    alt = app_id;
-    for (auto &c : alt) { if (c == '-') c = '.'; }
+    alt = app_id; for (auto &c : alt) { if (c == '-') c = '.'; }
     if (alt != app_id && load_icon_by_name(alt, target_size)) return true;
     return false;
   }
@@ -249,33 +237,22 @@ struct icon_tex_t {
     width = height = target_size;
     auto surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width, height);
     auto cr = cairo_create(surface);
-
-    double r = target_size * 0.22;
-    double inset = target_size * 0.04;
-    double iw = target_size - inset * 2;
+    double r = target_size * 0.22, inset = target_size * 0.04, iw = target_size - inset * 2;
     cairo_new_sub_path(cr);
     cairo_arc(cr, inset + r, inset + r, r, M_PI, 1.5 * M_PI);
     cairo_arc(cr, inset + iw - r, inset + r, r, -0.5 * M_PI, 0);
     cairo_arc(cr, inset + iw - r, inset + iw - r, r, 0, 0.5 * M_PI);
     cairo_arc(cr, inset + r, inset + iw - r, r, 0.5 * M_PI, M_PI);
     cairo_close_path(cr);
-
     auto pat = cairo_pattern_create_linear(0, inset, 0, inset + iw);
     cairo_pattern_add_color_stop_rgba(pat, 0, 0.35, 0.45, 0.55, 0.92);
     cairo_pattern_add_color_stop_rgba(pat, 1, 0.20, 0.30, 0.40, 0.92);
-    cairo_set_source(cr, pat);
-    cairo_fill_preserve(cr);
-    cairo_pattern_destroy(pat);
-
-    cairo_set_source_rgba(cr, 1, 1, 1, 0.15);
-    cairo_set_line_width(cr, 1.0);
-    cairo_stroke(cr);
-
+    cairo_set_source(cr, pat); cairo_fill_preserve(cr); cairo_pattern_destroy(pat);
+    cairo_set_source_rgba(cr, 1, 1, 1, 0.15); cairo_set_line_width(cr, 1.0); cairo_stroke(cr);
     if (!app_name.empty()) {
       char letter[2] = {(char)toupper(app_name[0]), 0};
       auto layout = pango_cairo_create_layout(cr);
-      char font[32];
-      snprintf(font, sizeof(font), "Sans Bold %d", target_size * 2 / 5);
+      char font[32]; snprintf(font, sizeof(font), "Sans Bold %d", target_size * 2 / 5);
       auto fd = pango_font_description_from_string(font);
       pango_layout_set_font_description(layout, fd);
       pango_layout_set_text(layout, letter, 1);
@@ -283,10 +260,8 @@ struct icon_tex_t {
       cairo_set_source_rgba(cr, 1, 1, 1, 0.92);
       cairo_move_to(cr, (width - tw) / 2.0, (height - th) / 2.0);
       pango_cairo_show_layout(cr, layout);
-      pango_font_description_free(fd);
-      g_object_unref(layout);
+      pango_font_description_free(fd); g_object_unref(layout);
     }
-
     cairo_surface_flush(surface);
     auto data = cairo_image_surface_get_data(surface);
     glGenTextures(1, &tex_id);
@@ -295,18 +270,14 @@ struct icon_tex_t {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_BGRA_EXT, GL_UNSIGNED_BYTE, data);
     glBindTexture(GL_TEXTURE_2D, 0);
-    cairo_destroy(cr);
-    cairo_surface_destroy(surface);
+    cairo_destroy(cr); cairo_surface_destroy(surface);
   }
 
-  void destroy() {
-    if (tex_id) { glDeleteTextures(1, &tex_id); tex_id = 0; }
-    width = height = 0;
-  }
+  void destroy() { if (tex_id) { glDeleteTextures(1, &tex_id); tex_id = 0; } width = height = 0; }
 };
 
 // ============================================================================
-// Window Slot
+// Window Slot (unchanged from original)
 // ============================================================================
 
 struct window_slot_t {
@@ -316,15 +287,13 @@ struct window_slot_t {
   std::shared_ptr<wf::scene::view_2d_transformer_t> transformer;
   bool hovered = false;
   icon_tex_t icon;
-  std::string app_id;
-  std::string app_name;
+  std::string app_id, app_name;
 
   void start_anim(bool entering, float duration) {
     anim.set_duration(duration);
     if (entering) { anim.warp(orig_geo); anim.animate_to(target_geo); }
     else { anim.animate_to(orig_geo); }
   }
-
   void update_transformer() {
     if (!transformer || !view || !view->is_mapped() || orig_geo.width <= 0 || orig_geo.height <= 0) return;
     auto cur = anim.current();
@@ -335,43 +304,31 @@ struct window_slot_t {
     transformer->scale_x = sx; transformer->scale_y = sy;
     transformer->alpha = hovered ? 1.0f : 0.88f;
   }
-
   void reset_transformer() {
     if (!transformer) return;
     transformer->translation_x = transformer->translation_y = 0;
     transformer->scale_x = transformer->scale_y = transformer->alpha = 1.0f;
   }
-
   static std::string make_app_name(wayfire_toplevel_view v) {
     if (!v) return "";
     auto id = v->get_app_id();
-    if (id.empty()) {
-      auto t = v->get_title();
-      auto sp = t.find(' ');
-      id = (sp != std::string::npos) ? t.substr(0, sp) : t;
-    }
-    if (!id.empty()) {
-      id[0] = std::toupper(id[0]);
-      for (auto &c : id) { if (c == '-' || c == '_') c = ' '; }
-    }
+    if (id.empty()) { auto t = v->get_title(); auto sp = t.find(' '); id = (sp != std::string::npos) ? t.substr(0, sp) : t; }
+    if (!id.empty()) { id[0] = std::toupper(id[0]); for (auto &c : id) { if (c == '-' || c == '_') c = ' '; } }
     if (id.length() > 24) id = id.substr(0, 22) + "...";
     return id;
   }
 };
 
 // ============================================================================
-// Top Panel
+// Top Panel (unchanged from original)
 // ============================================================================
 
 class top_panel_t {
 public:
   wf::output_t *output;
-  cairo_surface_t *surface = nullptr;
-  cairo_t *cr = nullptr;
-  GLuint tex_id = 0;
-  int width = 0, height = 16;
-  wf::geometry_t activities_bounds{};
-  bool activities_hovered = false;
+  cairo_surface_t *surface = nullptr; cairo_t *cr = nullptr;
+  GLuint tex_id = 0; int width = 0, height = 16;
+  wf::geometry_t activities_bounds{}; bool activities_hovered = false;
   std::string color = "#1a1a1aE6";
 
   top_panel_t(wf::output_t *out, int h, const std::string &c) : output(out), height(h), color(c) { create(); }
@@ -380,16 +337,13 @@ public:
   void create() {
     width = output->get_layout_geometry().width;
     surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width, height);
-    cr = cairo_create(surface);
-    render(); upload();
+    cr = cairo_create(surface); render(); upload();
   }
-
   void destroy() {
     if (tex_id) { wf::gles::run_in_context([&] { glDeleteTextures(1, &tex_id); }); tex_id = 0; }
     if (cr) { cairo_destroy(cr); cr = nullptr; }
     if (surface) { cairo_surface_destroy(surface); surface = nullptr; }
   }
-
   void render() {
     if (!cr) return;
     float r = 0.1f, g = 0.1f, b = 0.1f, a = 0.9f;
@@ -399,44 +353,24 @@ public:
       b = std::stoi(color.substr(5,2), nullptr, 16) / 255.0f;
       if (color.length() >= 9) a = std::stoi(color.substr(7,2), nullptr, 16) / 255.0f;
     }
-    cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
-    cairo_set_source_rgba(cr, r, g, b, a);
-    cairo_paint(cr);
-
+    cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE); cairo_set_source_rgba(cr, r, g, b, a); cairo_paint(cr);
     PangoLayout *layout = pango_cairo_create_layout(cr);
-    int fs = height >= 24 ? 11 : 8;
-    char font[32]; snprintf(font, sizeof(font), "Sans Bold %d", fs);
+    int fs = height >= 24 ? 11 : 8; char font[32]; snprintf(font, sizeof(font), "Sans Bold %d", fs);
     PangoFontDescription *fd = pango_font_description_from_string(font);
     pango_layout_set_font_description(layout, fd);
-
     pango_layout_set_text(layout, "Activities", -1);
     int tw, th; pango_layout_get_pixel_size(layout, &tw, &th);
     int ax = 8, ay = (height - th) / 2;
     activities_bounds = {ax - 4, 0, tw + 8, height};
-    if (activities_hovered) {
-      cairo_set_source_rgba(cr, 1, 1, 1, 0.15);
-      cairo_rectangle(cr, activities_bounds.x, 0, activities_bounds.width, height);
-      cairo_fill(cr);
-    }
-    cairo_set_source_rgba(cr, 1, 1, 1, 1);
-    cairo_move_to(cr, ax, ay);
-    pango_cairo_show_layout(cr, layout);
-
-    time_t now = time(nullptr);
-    char ts[64]; strftime(ts, sizeof(ts), "%a %b %d  %H:%M", localtime(&now));
-    pango_layout_set_text(layout, ts, -1);
-    pango_layout_get_pixel_size(layout, &tw, &th);
-    cairo_move_to(cr, (width - tw) / 2, (height - th) / 2);
-    pango_cairo_show_layout(cr, layout);
-
-    pango_font_description_free(fd);
-    g_object_unref(layout);
-    cairo_surface_flush(surface);
+    if (activities_hovered) { cairo_set_source_rgba(cr, 1, 1, 1, 0.15); cairo_rectangle(cr, activities_bounds.x, 0, activities_bounds.width, height); cairo_fill(cr); }
+    cairo_set_source_rgba(cr, 1, 1, 1, 1); cairo_move_to(cr, ax, ay); pango_cairo_show_layout(cr, layout);
+    time_t now = time(nullptr); char ts[64]; strftime(ts, sizeof(ts), "%a %b %d  %H:%M", localtime(&now));
+    pango_layout_set_text(layout, ts, -1); pango_layout_get_pixel_size(layout, &tw, &th);
+    cairo_move_to(cr, (width - tw) / 2, (height - th) / 2); pango_cairo_show_layout(cr, layout);
+    pango_font_description_free(fd); g_object_unref(layout); cairo_surface_flush(surface);
   }
-
   void upload() {
-    if (!surface) return;
-    unsigned char *data = cairo_image_surface_get_data(surface);
+    if (!surface) return; unsigned char *data = cairo_image_surface_get_data(surface);
     wf::gles::run_in_context([&] {
       if (!tex_id) glGenTextures(1, &tex_id);
       glBindTexture(GL_TEXTURE_2D, tex_id);
@@ -446,24 +380,12 @@ public:
       glBindTexture(GL_TEXTURE_2D, 0);
     });
   }
-
-  wf::geometry_t get_geometry() const {
-    auto og = output->get_layout_geometry();
-    return {og.x, og.y, width, height};
-  }
-  wf::geometry_t get_render_geometry() const {
-    auto og = output->get_layout_geometry();
-    return {og.x, og.y + og.height - height, width, height};
-  }
-  bool set_hover(bool h) {
-    if (activities_hovered == h) return false;
-    activities_hovered = h; render(); upload(); return true;
-  }
+  wf::geometry_t get_geometry() const { auto og = output->get_layout_geometry(); return {og.x, og.y, width, height}; }
+  wf::geometry_t get_render_geometry() const { auto og = output->get_layout_geometry(); return {og.x, og.y + og.height - height, width, height}; }
+  bool set_hover(bool h) { if (activities_hovered == h) return false; activities_hovered = h; render(); upload(); return true; }
   bool point_in_activities(wf::pointf_t p) const {
-    auto og = output->get_layout_geometry();
-    int lx = p.x - og.x, ly = p.y - og.y;
-    return lx >= activities_bounds.x && lx < activities_bounds.x + activities_bounds.width &&
-           ly >= 0 && ly < height;
+    auto og = output->get_layout_geometry(); int lx = p.x - og.x, ly = p.y - og.y;
+    return lx >= activities_bounds.x && lx < activities_bounds.x + activities_bounds.width && ly >= 0 && ly < height;
   }
 };
 
@@ -472,193 +394,222 @@ public:
 // ============================================================================
 
 struct drag_state_t {
-  bool active = false;
-  wayfire_toplevel_view view = nullptr;
-  int slot_index = -1;
+  bool active = false; wayfire_toplevel_view view = nullptr; int slot_index = -1;
   wf::pointf_t grab_cursor{0, 0}, current_cursor{0, 0};
-  wf::geometry_t initial_screen_geo{};
-  int hover_ws = -1;
-  wf::auxilliary_buffer_t snapshot_fb;
-  bool has_snapshot = false, needs_capture = false;
-  int float_width = 0, float_height = 0;
-  wf::geometry_t view_geo{};
+  wf::geometry_t initial_screen_geo{}; int hover_ws = -1; int hover_large_ws = -1;
+  wf::auxilliary_buffer_t snapshot_fb; bool has_snapshot = false, needs_capture = false;
+  int float_width = 0, float_height = 0; wf::geometry_t view_geo{};
   wf::pointf_t grab_offset_in_window{0, 0};
-  void reset() {
-    active = false; view = nullptr; slot_index = -1;
-    hover_ws = -1; has_snapshot = false; needs_capture = false;
-  }
+  void reset() { active = false; view = nullptr; slot_index = -1; hover_ws = -1; hover_large_ws = -1; has_snapshot = false; needs_capture = false; }
 };
 
 // ============================================================================
-// Activities View — GNOME Shell-like layout
+// Activities View — uses EXACT same coordinate system as original
 // ============================================================================
 
 class activities_view_t {
 public:
   wf::output_t *output;
-  std::vector<window_slot_t> slots;
+
+  struct ws_window_data_t {
+    std::vector<window_slot_t> slots;
+    bool transformers_attached = false;
+  };
+  std::vector<ws_window_data_t> ws_windows;
+
+  int focused_ws = 0;
+  wf::point_t orig_ws{0, 0};
   wayfire_toplevel_view hovered_view = nullptr;
-  wf::geometry_t preview_geo{};
-  anim_geo_t desktop_anim;
+  anim_t carousel_scroll;  // pixel offset in render-space X
+
+  // Preview dimensions — computed IDENTICALLY to original
+  wf::geometry_t preview_geo{};  // base preview rect (for focused ws)
+  int carousel_gap = 0;
+
   std::vector<wf::geometry_t> ws_geos;
-  int ws_rows = 1, ws_cols = 1;
+  int ws_rows = 1, ws_cols = 1, total_ws = 1;
   wf::point_t cur_ws{0, 0};
-  bool switching_ws = false;
-  int pending_ws = -1;
-  bool is_active = false, is_animating = false, transformers_attached = false;
+  anim_geo_t desktop_anim;
+
+  bool is_active = false, is_animating = false;
+  bool switching_ws = false; int pending_ws = -1;
   int corner_radius = 12, spacing = 20, panel_height = 16, anim_duration = 300;
-  // FIX: larger icon rendered ON the window thumbnail
   int icon_size = 72;
   drag_state_t drag;
 
-  activities_view_t(wf::output_t *out) : output(out) { desktop_anim.set_duration(anim_duration); }
-  ~activities_view_t() { cleanup(); }
+  activities_view_t(wf::output_t *out) : output(out) { desktop_anim.set_duration(300); carousel_scroll.set_duration(300); }
+  ~activities_view_t() { cleanup_all(); }
 
   void set_config(int cr, int sp, int ph, int ad) {
     corner_radius = cr; spacing = sp; panel_height = ph; anim_duration = ad;
-    desktop_anim.set_duration(ad);
+    desktop_anim.set_duration(ad); carousel_scroll.set_duration(ad);
   }
 
   void toggle() { is_active ? deactivate() : activate(); }
 
+  std::vector<wayfire_toplevel_view> get_views_on_workspace(wf::point_t ws) {
+    auto cur = output->wset()->get_current_workspace();
+    auto og = output->get_layout_geometry();
+    std::vector<wayfire_toplevel_view> result;
+    for (auto &v : output->wset()->get_views(wf::WSET_MAPPED_ONLY)) {
+      auto tv = wf::toplevel_cast(v);
+      if (!tv || tv->get_output() != output || tv->minimized || !tv->is_mapped()) continue;
+      auto vg = tv->get_geometry();
+      int vws_x = cur.x + (int)std::floor((float)(vg.x + vg.width/2) / og.width);
+      int vws_y = cur.y + (int)std::floor((float)(vg.y + vg.height/2) / og.height);
+      if (vws_x == ws.x && vws_y == ws.y) result.push_back(tv);
+    }
+    return result;
+  }
+
+  wf::point_t ws_index_to_point(int idx) const { return {idx % ws_cols, idx / ws_cols}; }
+  int ws_point_to_index(wf::point_t p) const { return p.y * ws_cols + p.x; }
+
   void activate() {
     if (is_active) return;
-    is_active = is_animating = true;
-    transformers_attached = false;
-    drag.reset();
+    is_active = is_animating = true; drag.reset();
 
     auto wsize = output->wset()->get_workspace_grid_size();
-    ws_cols = wsize.width; ws_rows = wsize.height;
+    ws_cols = wsize.width; ws_rows = wsize.height; total_ws = ws_cols * ws_rows;
     cur_ws = output->wset()->get_current_workspace();
+    orig_ws = cur_ws;
+    focused_ws = ws_point_to_index(cur_ws);
 
-    slots.clear();
-    for (auto &v : output->wset()->get_views(wf::WSET_MAPPED_ONLY | wf::WSET_CURRENT_WORKSPACE)) {
-      auto tv = wf::toplevel_cast(v);
-      if (tv && tv->get_output() == output && !tv->minimized && tv->is_mapped()) {
+    ws_windows.clear(); ws_windows.resize(total_ws);
+    auto og = output->get_layout_geometry();
+
+    for (int i = 0; i < total_ws; i++) {
+      auto wsp = ws_index_to_point(i);
+      int ox = (wsp.x - cur_ws.x) * og.width, oy = (wsp.y - cur_ws.y) * og.height;
+      for (auto &tv : get_views_on_workspace(wsp)) {
         window_slot_t s; s.view = tv;
-        s.orig_geo = tv->get_geometry();
+        auto vg = tv->get_geometry();
+        s.orig_geo = {vg.x - ox, vg.y - oy, vg.width, vg.height};
         if (s.orig_geo.width <= 0) s.orig_geo.width = 100;
         if (s.orig_geo.height <= 0) s.orig_geo.height = 100;
-        s.app_id = tv->get_app_id();
-        s.app_name = window_slot_t::make_app_name(tv);
-        slots.push_back(s);
+        s.app_id = tv->get_app_id(); s.app_name = window_slot_t::make_app_name(tv);
+        ws_windows[i].slots.push_back(s);
       }
     }
 
     arrange();
-    attach_transformers();
-    load_icons();
+    for (int i = 0; i < total_ws; i++) { attach_transformers_for_ws(i); load_icons_for_ws(i); }
 
-    auto og = output->get_layout_geometry();
+    carousel_scroll.set_duration(anim_duration);
+    carousel_scroll.warp(scroll_target_for(focused_ws));
+
     desktop_anim.warp({0, 0, og.width, og.height});
     desktop_anim.animate_to(preview_geo);
   }
 
-  void load_icons() {
+  void load_icons_for_ws(int wi) {
+    if (wi < 0 || wi >= (int)ws_windows.size()) return;
     wf::gles::run_in_context([&] {
-      for (auto &s : slots) {
-        if (!s.icon.load_for_app(s.app_id, icon_size)) {
-          s.icon.create_fallback(s.app_name, icon_size);
-        }
-      }
+      for (auto &s : ws_windows[wi].slots)
+        if (!s.icon.load_for_app(s.app_id, icon_size)) s.icon.create_fallback(s.app_name, icon_size);
     });
   }
 
-  void deactivate() {
-    if (!is_active) return;
-    drag.reset();
-    is_animating = true;
-    for (auto &s : slots) s.start_anim(false, anim_duration);
-    auto og = output->get_layout_geometry();
-    desktop_anim.animate_to({0, 0, og.width, og.height});
-  }
-
-  void deactivate_to_ws(int idx) {
-    if (!is_active) return;
-    drag.reset();
-    pending_ws = idx; switching_ws = true;
-    if (idx >= 0 && idx < (int)ws_geos.size()) desktop_anim.warp(ws_geos[idx]);
-    cleanup();
-    auto og = output->get_layout_geometry();
-    desktop_anim.animate_to({0, 0, og.width, og.height});
-    is_animating = true;
-  }
-
-  void cleanup() {
-    wf::gles::run_in_context_if_gles([&] {
-      for (auto &s : slots) s.icon.destroy();
-    });
-    for (auto &s : slots) {
-      if (s.view && s.view->is_mapped() && s.transformer) {
-        s.reset_transformer();
-        s.view->get_transformed_node()->rem_transformer(TRANSFORMER_NAME);
-      }
-    }
-    slots.clear(); transformers_attached = false;
-  }
-
-  void attach_transformers() {
-    if (transformers_attached) return;
-    for (auto &s : slots) {
+  void attach_transformers_for_ws(int wi) {
+    if (wi < 0 || wi >= (int)ws_windows.size()) return;
+    auto &wd = ws_windows[wi]; if (wd.transformers_attached) return;
+    for (auto &s : wd.slots) {
       if (!s.view || !s.view->is_mapped()) continue;
       s.transformer = std::make_shared<wf::scene::view_2d_transformer_t>(s.view);
       s.view->get_transformed_node()->add_transformer(s.transformer, wf::TRANSFORMER_2D, TRANSFORMER_NAME);
       s.start_anim(true, anim_duration);
     }
-    transformers_attached = true;
+    wd.transformers_attached = true;
+  }
+
+  void detach_transformers_for_ws(int wi) {
+    if (wi < 0 || wi >= (int)ws_windows.size()) return;
+    auto &wd = ws_windows[wi];
+    for (auto &s : wd.slots) {
+      if (s.view && s.view->is_mapped() && s.transformer) { s.reset_transformer(); s.view->get_transformed_node()->rem_transformer(TRANSFORMER_NAME); }
+      s.transformer = nullptr;
+    }
+    wd.transformers_attached = false;
+  }
+
+  void deactivate() {
+    if (!is_active) return; drag.reset(); is_animating = true;
+    for (auto &wd : ws_windows) for (auto &s : wd.slots) s.start_anim(false, anim_duration);
+    if (focused_ws != ws_point_to_index(orig_ws)) { pending_ws = focused_ws; switching_ws = true; }
+    auto og = output->get_layout_geometry();
+    desktop_anim.animate_to({0, 0, og.width, og.height});
+  }
+
+  void deactivate_to_ws(int idx) {
+    if (!is_active) return; drag.reset();
+    pending_ws = idx; switching_ws = true;
+    // Animate windows back to original positions
+    for (auto &wd : ws_windows) for (auto &s : wd.slots) s.start_anim(false, anim_duration);
+    // Warp desktop_anim to the small thumbnail position, then zoom to full screen
+    // This creates the GNOME-like "zoom from thumbnail" effect
+    if (idx >= 0 && idx < (int)ws_geos.size())
+      desktop_anim.warp(ws_geos[idx]);
+    auto og = output->get_layout_geometry();
+    desktop_anim.set_duration(anim_duration);
+    desktop_anim.animate_to({0, 0, og.width, og.height});
+    is_animating = true;
+  }
+
+  void cleanup_all() {
+    wf::gles::run_in_context_if_gles([&] { for (auto &wd : ws_windows) for (auto &s : wd.slots) s.icon.destroy(); });
+    for (int i = 0; i < (int)ws_windows.size(); i++) detach_transformers_for_ws(i);
+    ws_windows.clear();
+  }
+
+  void navigate_to(int ws_idx) {
+    if (ws_idx < 0 || ws_idx >= total_ws || ws_idx == focused_ws) return;
+    focused_ws = ws_idx;
+    carousel_scroll.set_duration(anim_duration);
+    carousel_scroll.animate_to(scroll_target_for(ws_idx));
+    is_animating = true;
+  }
+
+  float scroll_target_for(int ws_idx) const {
+    auto og = output->get_layout_geometry();
+    float ws_cx = ws_idx * (preview_geo.width + carousel_gap) + preview_geo.width / 2.0f;
+    return ws_cx - og.width / 2.0f;
   }
 
   void tick() {
-    desktop_anim.tick();
-    for (auto &s : slots) {
-      s.anim.tick(); s.update_transformer();
-      if (s.view && s.view->is_mapped()) s.view->damage();
-    }
+    desktop_anim.tick(); carousel_scroll.tick();
+    for (auto &wd : ws_windows) for (auto &s : wd.slots) { s.anim.tick(); s.update_transformer(); if (s.view && s.view->is_mapped()) s.view->damage(); }
     check_done();
   }
 
   void check_done() {
     if (!is_animating) return;
-    bool any = desktop_anim.is_animating();
-    for (auto &s : slots) if (s.anim.is_animating()) { any = true; break; }
+    bool any = desktop_anim.is_animating() || carousel_scroll.is_animating();
+    for (auto &wd : ws_windows) { for (auto &s : wd.slots) if (s.anim.is_animating()) { any = true; break; } if (any) break; }
     if (any) return;
     is_animating = false;
-    auto og = output->get_layout_geometry();
-    auto cur = desktop_anim.current();
+    auto og = output->get_layout_geometry(); auto cur = desktop_anim.current();
     if (cur.width >= og.width - 10) {
-      if (switching_ws && pending_ws >= 0) {
-        output->wset()->set_workspace({pending_ws % ws_cols, pending_ws / ws_cols});
-        switching_ws = false; pending_ws = -1;
-      }
-      cleanup(); is_active = false;
+      if (switching_ws && pending_ws >= 0) { output->wset()->set_workspace(ws_index_to_point(pending_ws)); switching_ws = false; pending_ws = -1; }
+      cleanup_all(); is_active = false;
     }
   }
 
-  // GNOME-like grid: prefer wider grids, aspect-ratio aware
   static void gnome_grid(int n, float area_aspect, int &cols, int &rows) {
-    if (n <= 0) { cols = rows = 1; return; }
-    if (n == 1) { cols = rows = 1; return; }
-    if (n == 2) { cols = 2; rows = 1; return; }
-    if (n == 3) { cols = 3; rows = 1; return; }
-
-    float best_score = 1e9f;
-    int best_c = 2, best_r = 1;
+    if (n <= 0) { cols = rows = 1; return; } if (n == 1) { cols = rows = 1; return; }
+    if (n == 2) { cols = 2; rows = 1; return; } if (n == 3) { cols = 3; rows = 1; return; }
+    float best_score = 1e9f; int best_c = 2, best_r = 1;
     for (int c = 2; c <= std::min(n, 6); c++) {
-      int r = (n + c - 1) / c;
-      float grid_aspect = (float)c / r;
-      float ratio_diff = std::abs(grid_aspect - area_aspect) / area_aspect;
-      float empty_penalty = (float)(c * r - n) / n * 0.5f;
-      float score = ratio_diff + empty_penalty;
-      if (score < best_score) { best_score = score; best_c = c; best_r = r; }
+      int r = (n + c - 1) / c; float ga = (float)c / r;
+      float rd = std::abs(ga - area_aspect) / area_aspect;
+      float ep = (float)(c * r - n) / n * 0.5f; float sc = rd + ep;
+      if (sc < best_score) { best_score = sc; best_c = c; best_r = r; }
     }
     cols = best_c; rows = best_r;
   }
 
   void arrange() {
     auto og = output->get_layout_geometry();
-    int total_ws = ws_cols * ws_rows;
 
-    // Workspace thumbnails — compact strip at bottom
     int th = og.height * 0.10;
     int tw = th * og.width / og.height;
     int ws_sp = spacing / 2;
@@ -670,7 +621,6 @@ public:
     for (int i = 0; i < total_ws; i++)
       ws_geos.push_back({ws_x + i * (tw + ws_sp), ws_y, tw, th});
 
-    // Main preview — large, GNOME-like
     int top = panel_height + spacing;
     int main_bot = ws_y - spacing;
     int avail_h = main_bot - top;
@@ -683,56 +633,71 @@ public:
     int my = top + (avail_h - mh) / 2;
     preview_geo = {mx, my, mw, mh};
 
-    if (slots.empty()) return;
+    carousel_gap = spacing * 2;
 
-    int n = (int)slots.size();
-    int cols, rows;
-    gnome_grid(n, (float)mw / mh, cols, rows);
+    for (int wi = 0; wi < total_ws; wi++) arrange_ws_windows(wi);
+  }
 
-    // FIX: No reserved icon space below windows — icons render ON the window
-    // Use full cell height for windows, tighter insets for maximum window size
-    int inset_x = spacing;
-    int inset_y = spacing;
-    int inset_bot = spacing;
-    int waw = mw - inset_x * 2;
-    int wah = mh - inset_y - inset_bot;
-    int gap = spacing;
+  void arrange_ws_windows(int wi) {
+    if (wi < 0 || wi >= (int)ws_windows.size()) return;
+    auto &wd = ws_windows[wi]; if (wd.slots.empty()) return;
+    auto og = output->get_layout_geometry();
+    int n = (int)wd.slots.size(); int cols, rows;
+    gnome_grid(n, (float)preview_geo.width / preview_geo.height, cols, rows);
 
-    int cw = (waw - gap * (cols - 1)) / cols;
-    int ch = (wah - gap * (rows - 1)) / rows;
-    int gw = cols * cw + (cols - 1) * gap;
+    int inset_x = spacing, inset_y = spacing, inset_bot = spacing;
+    int waw = og.width - inset_x * 2, wah = og.height - inset_y - inset_bot, gap = spacing;
+    int cw = (waw - gap * (cols - 1)) / cols, ch = (wah - gap * (rows - 1)) / rows;
     int gh = rows * ch + (rows - 1) * gap;
-    int gx_base = mx + (mw - gw) / 2;
-    int gy = my + inset_y + (wah - gh) / 2;
+    int gy = inset_y + (wah - gh) / 2;
 
     for (int i = 0; i < n; i++) {
-      auto &s = slots[i];
-      int col = i % cols, row = i / cols;
-
-      // Center last row if it has fewer items (GNOME behavior)
-      int items_this_row = (row == rows - 1) ? (n - row * cols) : cols;
-      int row_w = items_this_row * cw + (items_this_row - 1) * gap;
-      int row_x = mx + (mw - row_w) / 2;
-      int col_in_row = i - row * cols;
-
-      int cx = row_x + col_in_row * (cw + gap);
-      int cy = gy + row * (ch + gap);
-
-      // FIX: scale to fill full cell height — 0.95 fill for slight breathing room
-      double scale = std::min((double)cw / s.orig_geo.width,
-                              (double)ch / s.orig_geo.height) * 0.95;
-      int sw = (int)(s.orig_geo.width * scale);
-      int sh = (int)(s.orig_geo.height * scale);
-
-      // Center within cell
+      auto &s = wd.slots[i]; int row = i / cols;
+      int itr = (row == rows - 1) ? (n - row * cols) : cols;
+      int row_w = itr * cw + (itr - 1) * gap;
+      int row_x = (og.width - row_w) / 2;
+      int cir = i - row * cols;
+      int cx = row_x + cir * (cw + gap), cy = gy + row * (ch + gap);
+      double sc = std::min((double)cw / s.orig_geo.width, (double)ch / s.orig_geo.height) * 0.95;
+      int sw = (int)(s.orig_geo.width * sc), sh = (int)(s.orig_geo.height * sc);
       s.target_geo = { cx + (cw - sw) / 2, cy + (ch - sh) / 2, sw, sh };
     }
   }
 
-  // Coordinate mapping (accounts for GL Y-flip)
-  wf::pointf_t screen_to_workspace(wf::pointf_t screen_local) {
+  // Get large preview render geo for workspace ws_idx
+  // Returns in output-local screen coordinates (Y-down)
+  // scroll_target_for() already centers the focused ws, so no extra offset needed
+  wf::geometry_t get_large_ws_render_geo(int ws_idx) const {
+    float scroll = carousel_scroll.value();
+    float base_x = ws_idx * (preview_geo.width + carousel_gap);
+    float rx = base_x - scroll;
+    return {(int)rx, preview_geo.y, preview_geo.width, preview_geo.height};
+  }
+
+  // Hit testing: screen-local point — NO Y-flip needed, coords match screen space
+  int find_large_ws_at(wf::pointf_t screen_local) {
+    for (int i = 0; i < total_ws; i++) {
+      auto g = get_large_ws_render_geo(i);
+      if (screen_local.x >= g.x && screen_local.x < g.x + g.width &&
+          screen_local.y >= g.y && screen_local.y < g.y + g.height) return i;
+    }
+    return -1;
+  }
+
+  int find_thumb_ws_at(wf::pointf_t global_p) {
     auto og = output->get_layout_geometry();
-    auto dg = desktop_anim.current();
+    float lx = global_p.x - og.x, ly = og.height - (global_p.y - og.y);
+    for (size_t i = 0; i < ws_geos.size(); i++) {
+      auto &g = ws_geos[i];
+      if (lx >= g.x && lx < g.x + g.width && ly >= g.y && ly < g.y + g.height) return i;
+    }
+    return -1;
+  }
+
+  // Map screen-local → workspace-local (same math as original screen_to_workspace)
+  wf::pointf_t screen_to_ws_local(wf::pointf_t screen_local, int ws_idx) {
+    auto og = output->get_layout_geometry();
+    auto dg = get_large_ws_render_geo(ws_idx);
     if (dg.width <= 0 || dg.height <= 0) return screen_local;
     return {
       (screen_local.x - dg.x) * (float)og.width / dg.width,
@@ -740,175 +705,172 @@ public:
     };
   }
 
-  wayfire_toplevel_view find_view_at(wf::pointf_t screen_local) {
-    auto p = screen_to_workspace(screen_local);
-    for (auto it = slots.rbegin(); it != slots.rend(); ++it) {
-      auto g = it->anim.current();
-      if (p.x >= g.x && p.x < g.x + g.width && p.y >= g.y && p.y < g.y + g.height)
-        return it->view;
+  int find_slot_at(wf::pointf_t screen_local) {
+    if (focused_ws < 0 || focused_ws >= (int)ws_windows.size()) return -1;
+    if (find_large_ws_at(screen_local) != focused_ws) return -1;
+    auto wp = screen_to_ws_local(screen_local, focused_ws);
+    auto &slots = ws_windows[focused_ws].slots;
+    for (int i = (int)slots.size() - 1; i >= 0; i--) {
+      auto g = slots[i].anim.current();
+      if (wp.x >= g.x && wp.x < g.x + g.width && wp.y >= g.y && wp.y < g.y + g.height) return i;
     }
+    return -1;
+  }
+
+  wayfire_toplevel_view find_view_at(wf::pointf_t screen_local) {
+    int idx = find_slot_at(screen_local);
+    if (idx >= 0 && focused_ws >= 0 && focused_ws < (int)ws_windows.size())
+      return ws_windows[focused_ws].slots[idx].view;
     return nullptr;
   }
 
-  int find_slot_at(wf::pointf_t screen_local) {
-    auto p = screen_to_workspace(screen_local);
-    for (int i = (int)slots.size() - 1; i >= 0; i--) {
-      auto g = slots[i].anim.current();
-      if (p.x >= g.x && p.x < g.x + g.width && p.y >= g.y && p.y < g.y + g.height)
-        return i;
-    }
-    return -1;
-  }
-
-  int find_ws_at(wf::pointf_t p) {
-    auto og = output->get_layout_geometry();
-    float lx = p.x - og.x, ly = og.height - (p.y - og.y);
-    for (size_t i = 0; i < ws_geos.size(); i++) {
-      auto &g = ws_geos[i];
-      if (lx >= g.x && lx < g.x + g.width && ly >= g.y && ly < g.y + g.height)
-        return i;
-    }
-    return -1;
-  }
-
-  // ---- Drag-and-drop ----
-  bool start_drag(wf::pointf_t local_p) {
+  // Drag
+  bool start_drag(wf::pointf_t sl) {
     if (drag.active) return false;
-    int idx = find_slot_at(local_p);
-    if (idx < 0) return false;
-    auto &s = slots[idx];
-    auto cur = s.anim.current();
-
+    int idx = find_slot_at(sl);
+    if (idx < 0 || focused_ws < 0 || focused_ws >= (int)ws_windows.size()) return false;
+    auto &s = ws_windows[focused_ws].slots[idx]; auto cur = s.anim.current();
     drag.active = true; drag.view = s.view; drag.slot_index = idx;
-    drag.grab_cursor = local_p; drag.current_cursor = local_p; drag.hover_ws = -1;
-
-    auto og_dim = output->get_layout_geometry();
-    auto dg = desktop_anim.current();
-    float sx = (float)dg.width / og_dim.width;
-    float sy = (float)dg.height / og_dim.height;
-
-    drag.initial_screen_geo = {
-      (int)(dg.x + cur.x * sx),
-      (int)((float)og_dim.height - dg.y - dg.height + cur.y * sy),
-      (int)(cur.width * sx), (int)(cur.height * sy)
-    };
-    drag.float_width = drag.initial_screen_geo.width;
-    drag.float_height = drag.initial_screen_geo.height;
-    drag.view_geo = s.orig_geo;
-    drag.grab_offset_in_window = {
-      local_p.x - (float)drag.initial_screen_geo.x,
-      local_p.y - (float)drag.initial_screen_geo.y
-    };
+    drag.grab_cursor = sl; drag.current_cursor = sl; drag.hover_ws = -1; drag.hover_large_ws = -1;
+    auto dg = get_large_ws_render_geo(focused_ws); auto og = output->get_layout_geometry();
+    float sx = (float)dg.width / og.width, sy = (float)dg.height / og.height;
+    drag.initial_screen_geo = { (int)(dg.x + cur.x * sx), (int)((float)og.height - dg.y - dg.height + cur.y * sy), (int)(cur.width * sx), (int)(cur.height * sy) };
+    drag.float_width = drag.initial_screen_geo.width; drag.float_height = drag.initial_screen_geo.height;
+    drag.view_geo = s.view->get_geometry();
+    drag.grab_offset_in_window = { sl.x - (float)drag.initial_screen_geo.x, sl.y - (float)drag.initial_screen_geo.y };
     drag.needs_capture = true; drag.has_snapshot = false;
     return true;
   }
 
-  void update_drag(wf::pointf_t local_p, wf::pointf_t global_p) {
+  void update_drag(wf::pointf_t sl, wf::pointf_t gp) {
     if (!drag.active) return;
-    drag.current_cursor = local_p;
-    drag.hover_ws = find_ws_at(global_p);
+    drag.current_cursor = sl; drag.hover_ws = find_thumb_ws_at(gp);
+    drag.hover_large_ws = find_large_ws_at(sl);
+    if (drag.hover_large_ws == focused_ws) drag.hover_large_ws = -1;
   }
 
-  bool end_drag(wf::pointf_t global_p) {
+  bool end_drag(wf::pointf_t sl, wf::pointf_t gp) {
     if (!drag.active) return false;
-    int target_ws = find_ws_at(global_p);
-    int cur_ws_idx = cur_ws.y * ws_cols + cur_ws.x;
-
-    if (target_ws >= 0 && target_ws != cur_ws_idx && drag.view) {
-      move_view_to_workspace(drag.view, target_ws);
-      if (drag.slot_index >= 0 && drag.slot_index < (int)slots.size()) {
-        auto &s = slots[drag.slot_index];
-        if (s.view && s.view->is_mapped() && s.transformer) {
-          s.reset_transformer();
-          s.view->get_transformed_node()->rem_transformer(TRANSFORMER_NAME);
-        }
+    int tw = find_thumb_ws_at(gp), tl = find_large_ws_at(sl);
+    if (tl == focused_ws) tl = -1;
+    int at = -1;
+    if (tw >= 0 && tw != focused_ws) at = tw; else if (tl >= 0) at = tl;
+    if (at >= 0 && drag.view) {
+      auto moved_view = drag.view;
+      move_view_to_workspace(moved_view, at);
+      // Remove from source workspace
+      if (drag.slot_index >= 0 && drag.slot_index < (int)ws_windows[focused_ws].slots.size()) {
+        auto &s = ws_windows[focused_ws].slots[drag.slot_index];
+        if (s.view && s.view->is_mapped() && s.transformer) { s.reset_transformer(); s.view->get_transformed_node()->rem_transformer(TRANSFORMER_NAME); }
         wf::gles::run_in_context([&] { s.icon.destroy(); });
-        slots.erase(slots.begin() + drag.slot_index);
+        ws_windows[focused_ws].slots.erase(ws_windows[focused_ws].slots.begin() + drag.slot_index);
       }
-      drag.reset(); rearrange_after_remove(); return true;
+      drag.reset();
+      // Rearrange source workspace
+      rearrange_focused_ws();
+      // Add to destination workspace and rearrange it
+      add_view_to_ws(moved_view, at);
+      return true;
     }
-
-    if (drag.slot_index >= 0 && drag.slot_index < (int)slots.size()) {
-      auto &s = slots[drag.slot_index];
+    if (drag.slot_index >= 0 && focused_ws >= 0 && focused_ws < (int)ws_windows.size() && drag.slot_index < (int)ws_windows[focused_ws].slots.size()) {
+      auto &s = ws_windows[focused_ws].slots[drag.slot_index];
       if (s.transformer) s.transformer->alpha = 0.88f;
-      s.anim.set_duration(anim_duration); s.anim.animate_to(s.target_geo);
-      is_animating = true;
+      s.anim.set_duration(anim_duration); s.anim.animate_to(s.target_geo); is_animating = true;
     }
     drag.reset(); return false;
   }
 
   void cancel_drag() {
     if (!drag.active) return;
-    if (drag.slot_index >= 0 && drag.slot_index < (int)slots.size()) {
-      auto &s = slots[drag.slot_index];
+    if (drag.slot_index >= 0 && focused_ws >= 0 && focused_ws < (int)ws_windows.size() && drag.slot_index < (int)ws_windows[focused_ws].slots.size()) {
+      auto &s = ws_windows[focused_ws].slots[drag.slot_index];
       if (s.transformer) s.transformer->alpha = 0.88f;
-      s.anim.set_duration(anim_duration); s.anim.animate_to(s.target_geo);
-      is_animating = true;
+      s.anim.set_duration(anim_duration); s.anim.animate_to(s.target_geo); is_animating = true;
     }
     drag.reset();
   }
 
-  void move_view_to_workspace(wayfire_toplevel_view view, int ws_idx) {
+  void move_view_to_workspace(wayfire_toplevel_view view, int wi) {
     if (!view || !view->is_mapped()) return;
-    int tx = ws_idx % ws_cols, ty = ws_idx / ws_cols;
-    auto og = output->get_layout_geometry();
-    auto vg = view->get_geometry();
-    view->move(vg.x + (tx - cur_ws.x) * og.width, vg.y + (ty - cur_ws.y) * og.height);
+    auto t = ws_index_to_point(wi); auto c = output->wset()->get_current_workspace();
+    auto og = output->get_layout_geometry(); auto vg = view->get_geometry();
+    view->move(vg.x + (t.x - c.x) * og.width, vg.y + (t.y - c.y) * og.height);
   }
 
-  void rearrange_after_remove() {
-    if (slots.empty()) return;
-    int n = (int)slots.size();
-    int cols, rows;
-    gnome_grid(n, (float)preview_geo.width / preview_geo.height, cols, rows);
-
-    // FIX: match arrange() — no icon_space reservation
-    int inset_x = spacing, inset_y = spacing, inset_bot = spacing;
-    int waw = preview_geo.width - inset_x * 2;
-    int wah = preview_geo.height - inset_y - inset_bot;
-    int gap = spacing;
-    int cw = (waw - gap * (cols - 1)) / cols;
-    int ch = (wah - gap * (rows - 1)) / rows;
-    int gy = preview_geo.y + inset_y + (wah - (rows * ch + (rows - 1) * gap)) / 2;
-
-    for (int i = 0; i < n; i++) {
-      auto &s = slots[i];
-      int row = i / cols;
-      int items_this_row = (row == rows - 1) ? (n - row * cols) : cols;
-      int row_w = items_this_row * cw + (items_this_row - 1) * gap;
-      int row_x = preview_geo.x + (preview_geo.width - row_w) / 2;
-      int col_in_row = i - row * cols;
-
-      int cx = row_x + col_in_row * (cw + gap);
-      int cy = gy + row * (ch + gap);
-      double scale = std::min((double)cw / s.orig_geo.width,
-                              (double)ch / s.orig_geo.height) * 0.95;
-      int sw = (int)(s.orig_geo.width * scale);
-      int sh = (int)(s.orig_geo.height * scale);
-      s.target_geo = { cx + (cw - sw) / 2, cy + (ch - sh) / 2, sw, sh };
-      s.anim.set_duration(anim_duration); s.anim.animate_to(s.target_geo);
-    }
+  void rearrange_focused_ws() {
+    if (focused_ws < 0 || focused_ws >= (int)ws_windows.size()) return;
+    arrange_ws_windows(focused_ws);
+    for (auto &s : ws_windows[focused_ws].slots) { s.anim.set_duration(anim_duration); s.anim.animate_to(s.target_geo); }
     is_animating = true;
   }
 
-  bool handle_click(wf::pointf_t p) {
+  void rearrange_ws(int wi) {
+    if (wi < 0 || wi >= (int)ws_windows.size()) return;
+    arrange_ws_windows(wi);
+    for (auto &s : ws_windows[wi].slots) { s.anim.set_duration(anim_duration); s.anim.animate_to(s.target_geo); }
+    is_animating = true;
+  }
+
+  void add_view_to_ws(wayfire_toplevel_view view, int dest_ws) {
+    if (!view || !view->is_mapped()) return;
+    if (dest_ws < 0 || dest_ws >= (int)ws_windows.size()) return;
     auto og = output->get_layout_geometry();
-    wf::pointf_t lp = {p.x - og.x, p.y - og.y};
+    auto wsp = ws_index_to_point(dest_ws);
+    int ox = (wsp.x - cur_ws.x) * og.width;
+    int oy = (wsp.y - cur_ws.y) * og.height;
+    auto vg = view->get_geometry();
+
+    window_slot_t s;
+    s.view = view;
+    s.orig_geo = {vg.x - ox, vg.y - oy, vg.width, vg.height};
+    if (s.orig_geo.width <= 0) s.orig_geo.width = 100;
+    if (s.orig_geo.height <= 0) s.orig_geo.height = 100;
+    s.app_id = view->get_app_id();
+    s.app_name = window_slot_t::make_app_name(view);
+
+    ws_windows[dest_ws].slots.push_back(s);
+    int idx = (int)ws_windows[dest_ws].slots.size() - 1;
+
+    // Attach transformer
+    auto &ns = ws_windows[dest_ws].slots[idx];
+    ns.transformer = std::make_shared<wf::scene::view_2d_transformer_t>(ns.view);
+    ns.view->get_transformed_node()->add_transformer(ns.transformer, wf::TRANSFORMER_2D, TRANSFORMER_NAME);
+
+    // Initialize animation at orig_geo so rearrange can animate to target
+    ns.anim.set_duration(anim_duration);
+    ns.anim.warp(ns.orig_geo);
+
+    // Load icon
+    wf::gles::run_in_context([&] {
+      if (!ns.icon.load_for_app(ns.app_id, icon_size))
+        ns.icon.create_fallback(ns.app_name, icon_size);
+    });
+
+    // Rearrange destination workspace and animate all slots to new positions
+    rearrange_ws(dest_ws);
+  }
+
+  bool handle_click(wf::pointf_t gp) {
+    auto og = output->get_layout_geometry();
+    wf::pointf_t lp = {gp.x - og.x, gp.y - og.y};
     if (auto v = find_view_at(lp)) { deactivate(); return true; }
-    int ws = find_ws_at(p);
+    int lws = find_large_ws_at(lp);
+    if (lws >= 0 && lws != focused_ws) { navigate_to(lws); return true; }
+    int ws = find_thumb_ws_at(gp);
     if (ws >= 0 && ws < (int)ws_geos.size()) {
-      int cur = cur_ws.y * ws_cols + cur_ws.x;
-      if (ws != cur) deactivate_to_ws(ws); else deactivate();
+      int c = cur_ws.y * ws_cols + cur_ws.x;
+      if (ws != c) deactivate_to_ws(ws); else deactivate();
       return true;
     }
     deactivate(); return true;
   }
 
-  void update_hover(wf::pointf_t p) {
+  void update_hover(wf::pointf_t sl) {
     if (drag.active) return;
-    auto nv = find_view_at(p);
+    auto nv = find_view_at(sl);
     if (nv != hovered_view) {
-      for (auto &s : slots) s.hovered = (s.view == nv);
+      if (focused_ws >= 0 && focused_ws < (int)ws_windows.size())
+        for (auto &s : ws_windows[focused_ws].slots) s.hovered = (s.view == nv);
       hovered_view = nv;
     }
   }
@@ -920,28 +882,24 @@ public:
 
   int get_animating_ws() const {
     if (switching_ws && pending_ws >= 0) return pending_ws;
-    return cur_ws.y * ws_cols + cur_ws.x;
+    return focused_ws;
   }
 };
 
 // ============================================================================
-// GL Render Helpers
+// GL Render Helpers (unchanged from original)
 // ============================================================================
 
 struct gl_programs_t {
-  OpenGL::program_t tex, rounded, col;
-  bool loaded = false;
-
+  OpenGL::program_t tex, rounded, col; bool loaded = false;
   void load() {
     if (loaded) return; loaded = true;
     const char *tv = "#version 100\nattribute vec2 position; attribute vec2 uv; varying vec2 vuv; uniform mat4 matrix;\nvoid main() { gl_Position = matrix * vec4(position, 0.0, 1.0); vuv = uv; }\n";
     const char *tf = "#version 100\nprecision mediump float; varying vec2 vuv; uniform sampler2D smp; uniform float alpha;\nvoid main() { vec4 c = texture2D(smp, vuv); gl_FragColor = vec4(c.rgb * alpha, c.a * alpha); }\n";
     tex.compile(tv, tf);
-
     const char *rv = "#version 100\nprecision mediump float; attribute vec2 position; attribute vec2 uv; varying vec2 vuv; varying vec2 fc; uniform mat4 matrix; uniform vec2 size;\nvoid main() { gl_Position = matrix * vec4(position, 0.0, 1.0); vuv = uv; fc = uv * size; }\n";
     const char *rf = "#version 100\nprecision mediump float; varying vec2 vuv; varying vec2 fc; uniform sampler2D smp; uniform float alpha; uniform float radius; uniform vec2 size;\nvoid main() { vec4 c = texture2D(smp, vuv); vec2 cd; if (fc.x < radius && fc.y < radius) cd = fc - vec2(radius); else if (fc.x > size.x - radius && fc.y < radius) cd = fc - vec2(size.x - radius, radius); else if (fc.x < radius && fc.y > size.y - radius) cd = fc - vec2(radius, size.y - radius); else if (fc.x > size.x - radius && fc.y > size.y - radius) cd = fc - vec2(size.x - radius, size.y - radius); else { gl_FragColor = vec4(c.rgb * alpha, c.a * alpha); return; } float d = length(cd); float aa = smoothstep(radius, radius - 1.5, d); gl_FragColor = vec4(c.rgb * alpha * aa, c.a * alpha * aa); }\n";
     rounded.compile(rv, rf);
-
     const char *cv = "#version 100\nattribute vec2 position; uniform mat4 matrix;\nvoid main() { gl_Position = matrix * vec4(position, 0.0, 1.0); }\n";
     const char *cf = "#version 100\nprecision mediump float; uniform vec4 color;\nvoid main() { gl_FragColor = color; }\n";
     col.compile(cv, cf);
@@ -1030,7 +988,7 @@ public:
 };
 
 // ============================================================================
-// Overview Render Node — renders the full overview with icon overlays ON windows
+// Overview Render Node — renders the full overview with workspace carousel
 // ============================================================================
 
 class overview_node_t : public wf::scene::node_t {
@@ -1070,8 +1028,10 @@ public:
     void capture_drag_snapshot(float scale) {
       auto &drg = self->activities->drag;
       if (!drg.needs_capture || drg.slot_index < 0) return;
-      if (drg.slot_index >= (int)self->activities->slots.size()) return;
-      auto &s = self->activities->slots[drg.slot_index];
+      int fws = self->activities->focused_ws;
+      if (fws < 0 || fws >= (int)self->activities->ws_windows.size()) return;
+      if (drg.slot_index >= (int)self->activities->ws_windows[fws].slots.size()) return;
+      auto &s = self->activities->ws_windows[fws].slots[drg.slot_index];
       if (!s.view || !s.view->is_mapped() || !s.transformer) { drg.needs_capture = false; return; }
       auto geo = drg.view_geo;
       if (geo.width <= 0 || geo.height <= 0) { drg.needs_capture = false; return; }
@@ -1102,7 +1062,8 @@ public:
       float scale = self->output->handle->scale;
       if (self->activities->drag.needs_capture) capture_drag_snapshot(scale);
 
-      bool force = self->activities->is_animating || self->activities->drag.active;
+      bool force = self->activities->is_animating || self->activities->drag.active
+                   || self->activities->carousel_scroll.is_animating();
       for (auto &c : captures) {
         auto wb = c.stream->get_bounding_box();
         c.fb.allocate(wf::dimensions(wb), scale);
@@ -1137,9 +1098,9 @@ public:
       auto og = output->get_layout_geometry();
       glClearColor(0, 0, 0, 1); glClear(GL_COLOR_BUFFER_BIT);
 
-      int aws = activities->get_animating_ws();
       float cr = activities->corner_radius;
       auto &drg = activities->drag;
+      int total = activities->total_ws;
 
       // Wallpaper + dark overlay
       if (wallpaper_tex) {
@@ -1148,97 +1109,145 @@ public:
         render_rect(progs->col, output, bg, {0, 0, 0, 0.55f});
       }
 
-      // Workspace thumbnails
+      // ============================================================
+      // Render small workspace thumbnails at bottom
+      // ============================================================
       auto &wsg = activities->ws_geos;
-      for (size_t i = 0; i < wsg.size() && i < caps.size(); i++) {
+      for (int i = 0; i < (int)wsg.size() && i < (int)caps.size(); i++) {
         wf::geometry_t g = {og.x + wsg[i].x, og.y + wsg[i].y, wsg[i].width, wsg[i].height};
-        float a = ((int)i == aws) ? 1.0f : 0.6f;
-        if (drg.active && drg.hover_ws == (int)i && (int)i != aws) a = 1.0f;
+        float a = (i == activities->focused_ws) ? 1.0f : 0.5f;
+        if (drg.active && drg.hover_ws == i && i != activities->focused_ws) a = 0.9f;
         auto t = wf::gles_texture_t::from_aux(caps[i].fb);
 
-        if (drg.active && drg.hover_ws == (int)i && (int)i != aws) {
+        if (drg.active && drg.hover_ws == i && i != activities->focused_ws) {
           wf::geometry_t border = {g.x - 2, g.y - 2, g.width + 4, g.height + 4};
           render_rect(progs->col, output, border, {0.3f, 0.55f, 1.0f, 0.6f});
         }
-        if ((int)i == aws) {
+        if (i == activities->focused_ws) {
           wf::geometry_t border = {g.x - 1, g.y - 1, g.width + 2, g.height + 2};
           render_rect(progs->col, output, border, {1.0f, 1.0f, 1.0f, 0.25f});
         }
         render_rounded(progs->rounded, output, t.tex_id, g, a, cr * 0.5f, true);
       }
 
-      // Main desktop preview
-      auto dg = activities->desktop_anim.current();
-      dg.x += og.x; dg.y += og.y;
-      if (dg.width > 0 && dg.height > 0 && aws >= 0 && aws < (int)caps.size()) {
-        float sf = (float)dg.width / og.width;
-        float rad = std::clamp(cr * 2.0f * (1.0f - sf), 0.0f, cr * 2.0f);
-        auto t = wf::gles_texture_t::from_aux(caps[aws].fb);
-        if (rad > 1) render_rounded(progs->rounded, output, t.tex_id, dg, 1.0f, rad, true);
-        else render_tex(progs->tex, output, t.tex_id, dg, 1.0f, true);
-      }
-
       // ============================================================
-      // FIX: App icons rendered ON each window thumbnail, at bottom
+      // Render large workspace previews
+      // During zoom animation: render focused ws with desktop_anim (like paste 3)
+      // When settled: render full carousel
       // ============================================================
-      // Coordinate system note:
-      //   - Workspace Y=0 is OpenGL bottom, increasing upward
-      //   - Screen Y increases downward (standard screen coords)
-      //   - dg maps workspace rect to screen rect with Y-flip
-      //   - ws_top (small ws.y) → larger render_y (lower on screen)
-      //   - ws_bot (large ws.y) → smaller render_y (higher on screen)
-      // So the "bottom" of a window in workspace coords appears HIGHER
-      // on screen (smaller render_y). Icons should be placed just above
-      // the render_y that corresponds to ws_bot, with a small inset.
-      // ============================================================
-      if (dg.width > 0 && dg.height > 0) {
-        float sxf = (float)dg.width / og.width;
-        float syf = (float)dg.height / og.height;
-        int isz = activities->icon_size;
+      bool zooming = activities->desktop_anim.is_animating();
+      int fws = activities->get_animating_ws();
 
-        for (auto &s : activities->slots) {
-          if (!s.icon.tex_id) continue;
-          if (drg.active && s.view == drg.view) continue;
+      if (zooming) {
+        // ---- ZOOM MODE: single focused workspace using desktop_anim ----
+        auto dg = activities->desktop_anim.current();
+        dg.x += og.x; dg.y += og.y;
+        if (dg.width > 0 && dg.height > 0 && fws >= 0 && fws < (int)caps.size()) {
+          float sf = (float)dg.width / og.width;
+          float rad = std::clamp(cr * 2.0f * (1.0f - sf), 0.0f, cr * 2.0f);
+          auto t = wf::gles_texture_t::from_aux(caps[fws].fb);
+          if (rad > 1) render_rounded(progs->rounded, output, t.tex_id, dg, 1.0f, rad, true);
+          else render_tex(progs->tex, output, t.tex_id, dg, 1.0f, true);
 
-          auto ws = s.anim.current();
-          float ws_cx = ws.x + ws.width / 2.0f;
-          float ws_bot = ws.y + ws.height;  // bottom edge of window in workspace coords
+          // Icons during zoom (same as paste 3)
+          if (fws < (int)activities->ws_windows.size()) {
+            auto &wd = activities->ws_windows[fws];
+            float sxf = (float)dg.width / og.width;
+            float syf = (float)dg.height / og.height;
+            int isz = activities->icon_size;
+            for (auto &s : wd.slots) {
+              if (!s.icon.tex_id) continue;
+              if (drg.active && s.view == drg.view) continue;
+              auto ws = s.anim.current();
+              float ws_cx = ws.x + ws.width / 2.0f;
+              float ws_bot = ws.y + ws.height;
+              float icon_render_sz = isz * sxf;
+              if (icon_render_sz < isz * 0.5f) icon_render_sz = isz * 0.5f;
+              float irx = dg.x + ws_cx * sxf - icon_render_sz / 2.0f;
+              float win_bot_ry = dg.y + dg.height * (1.0f - ws_bot / (float)og.height);
+              float inset_px = 10.0f * syf;
+              float iry = win_bot_ry + inset_px;
+              float win_top_ry = dg.y + dg.height * (1.0f - ws.y / (float)og.height);
+              float max_ry = win_top_ry - icon_render_sz - 4.0f;
+              if (iry > max_ry) iry = max_ry;
+              wf::geometry_t icon_box = {(int)irx, (int)iry, (int)icon_render_sz, (int)icon_render_sz};
+              float icon_alpha = s.hovered ? 1.0f : 0.90f;
+              render_tex(progs->tex, output, s.icon.tex_id, icon_box, icon_alpha, true);
+            }
+          }
+        }
+      } else {
+        // ---- CAROUSEL MODE: all workspaces at carousel positions ----
+        for (int i = 0; i < total && i < (int)caps.size(); i++) {
+          auto rg = activities->get_large_ws_render_geo(i);
 
-          // Icon render size — scale with preview, enforce min size
-          float icon_render_sz = isz * sxf;
-          if (icon_render_sz < isz * 0.5f) icon_render_sz = isz * 0.5f;
+          // Skip if completely off-screen
+          if (rg.x + rg.width < -rg.width || rg.x > og.width + rg.width) continue;
 
-          // Horizontal: centered on window
-          float rx = dg.x + ws_cx * sxf - icon_render_sz / 2.0f;
+          // Convert to global screen coords
+          wf::geometry_t gl_box = {og.x + rg.x, og.y + rg.y,
+                                   rg.width, rg.height};
 
-          // Vertical: place icon ON the window, anchored at the bottom.
-          // win_bot_ry is the render Y (screen coords) of the window's bottom edge.
-          // Due to Y-flip: render_y = dg.y + dg.height*(1 - ws_y/og.height)
-          // For the BOTTOM of the window (ws_bot), this gives a smaller render_y
-          // (higher on screen). We place the icon just inside that bottom edge.
-          float win_bot_ry = dg.y + dg.height * (1.0f - ws_bot / (float)og.height);
+          float alpha = (i == fws) ? 1.0f : 0.65f;
+          if (drg.active && drg.hover_large_ws == i) alpha = 0.95f;
 
-          // Icon sits at bottom of window: top of icon is inset_px above win_bot_ry
-          // (inset_px > 0 means the icon is INSIDE the window area)
-          float inset_px = 10.0f * syf;
-          float ry = win_bot_ry + inset_px;  // icon top (screen Y, so + means lower on screen)
+          auto t = wf::gles_texture_t::from_aux(caps[i].fb);
 
-          // Clamp so icon doesn't go below window bottom
-          float win_top_ry = dg.y + dg.height * (1.0f - ws.y / (float)og.height);
-          float max_ry = win_top_ry - icon_render_sz - 4.0f; // don't overflow window top
-          if (ry > max_ry) ry = max_ry;
+          if (i == fws) {
+            wf::geometry_t border = {gl_box.x - 2, gl_box.y - 2, gl_box.width + 4, gl_box.height + 4};
+            render_rect(progs->col, output, border, {1.0f, 1.0f, 1.0f, 0.12f});
+          }
+          if (drg.active && drg.hover_large_ws == i) {
+            wf::geometry_t border = {gl_box.x - 3, gl_box.y - 3, gl_box.width + 6, gl_box.height + 6};
+            render_rect(progs->col, output, border, {0.3f, 0.55f, 1.0f, 0.5f});
+          }
 
-          wf::geometry_t icon_box = {(int)rx, (int)ry, (int)icon_render_sz, (int)icon_render_sz};
-          float icon_alpha = s.hovered ? 1.0f : 0.90f;
-          render_tex(progs->tex, output, s.icon.tex_id, icon_box, icon_alpha, true);
+          render_rounded(progs->rounded, output, t.tex_id, gl_box, alpha, cr, true);
+
+          // App icons ON windows
+          if (i < (int)activities->ws_windows.size()) {
+            auto &wd = activities->ws_windows[i];
+            float sxf = (float)rg.width / og.width;
+            float syf = (float)rg.height / og.height;
+            int isz = activities->icon_size;
+
+            for (auto &s : wd.slots) {
+              if (!s.icon.tex_id) continue;
+              if (drg.active && s.view == drg.view) continue;
+
+              auto ws = s.anim.current();
+              float ws_cx = ws.x + ws.width / 2.0f;
+              float ws_bot = ws.y + ws.height;
+
+              float icon_render_sz = isz * sxf;
+              if (icon_render_sz < isz * 0.5f) icon_render_sz = isz * 0.5f;
+
+              float irx = gl_box.x + ws_cx * sxf - icon_render_sz / 2.0f;
+              float win_bot_ry = gl_box.y + gl_box.height * (1.0f - ws_bot / (float)og.height);
+              float inset_px = 10.0f * syf;
+              float iry = win_bot_ry + inset_px;
+              float win_top_ry = gl_box.y + gl_box.height * (1.0f - ws.y / (float)og.height);
+              float max_ry = win_top_ry - icon_render_sz - 4.0f;
+              if (iry > max_ry) iry = max_ry;
+
+              wf::geometry_t icon_box = {(int)irx, (int)iry, (int)icon_render_sz, (int)icon_render_sz};
+              float icon_alpha = s.hovered ? 1.0f : 0.90f;
+              if (i != fws) icon_alpha *= 0.6f;
+              render_tex(progs->tex, output, s.icon.tex_id, icon_box, icon_alpha, true);
+            }
+          }
         }
       }
 
+      // ============================================================
       // Panel
+      // ============================================================
       if (panel && panel->tex_id)
         render_tex(progs->tex, output, panel->tex_id, panel->get_render_geometry(), 1.0f, true);
 
+      // ============================================================
       // Floating drag thumbnail
+      // ============================================================
       if (drg.active && drg.has_snapshot && drg.float_width > 0 && drg.float_height > 0) {
         auto snap_t = wf::gles_texture_t::from_aux(drg.snapshot_fb);
         float sdx = drg.current_cursor.x - drg.grab_cursor.x;
@@ -1309,12 +1318,14 @@ public:
 
     pre_hook = [this]() {
       bool wa = activities->is_animating, wd = activities->drag.active;
+      bool wc = activities->carousel_scroll.is_animating();
       activities->tick();
       bool sa = activities->is_animating, sd = activities->drag.active;
-      if (sa || sd) {
+      bool sc = activities->carousel_scroll.is_animating();
+      if (sa || sd || sc) {
         if (render_node) wf::scene::damage_node(render_node, render_node->get_bounding_box());
         output->render->schedule_redraw();
-      } else if ((wa || wd) && !sa && !activities->is_active) {
+      } else if ((wa || wd || wc) && !sa && !activities->is_active) {
         output->render->damage_whole(); deactivate_hooks();
       }
     };
@@ -1401,7 +1412,7 @@ public:
         auto old = activities->hovered_view;
         activities->update_hover(local);
         if (old != activities->hovered_view && render_node)
-          wf::scene::damage_node(render_node, activities->get_preview_geo_output());
+          wf::scene::damage_node(render_node, render_node->get_bounding_box());
       }
     }
   }
@@ -1419,7 +1430,9 @@ public:
       bool wd = drag_started && activities->drag.active, wh = button_held;
       button_held = false;
       if (wd) {
-        activities->end_drag(cursor); drag_started = false;
+        auto og = output->get_layout_geometry();
+        wf::pointf_t local = {cursor.x - og.x, cursor.y - og.y};
+        activities->end_drag(local, cursor); drag_started = false;
         if (render_node) { wf::scene::damage_node(render_node, render_node->get_bounding_box()); output->render->schedule_redraw(); }
         output->render->damage_whole(); return true;
       }
